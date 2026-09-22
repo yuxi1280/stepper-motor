@@ -22,6 +22,11 @@
  * Include files
  ******************************************************************************/
 #include "main.h"
+#include "uart.h"
+#include "motor.h"
+#include "servo.h"
+#include "can.h"
+#include "check.h"
 
 /*******************************************************************************
  * Local type definitions ('typedef')
