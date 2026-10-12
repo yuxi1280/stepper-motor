@@ -238,3 +238,5 @@ void uart_driver_init(void)
     uart_init(&g_uart0);
     hw_init();
 }
+
+

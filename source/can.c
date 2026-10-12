@@ -242,3 +242,13 @@ void can_init(void)
     s_rxQueue.head = s_rxQueue.tail = 0U;
     s_txBusy = 0U;
 }
+
+// void can_poll(void)
+// {
+//     while (s_rxQueue.tail != s_rxQueue.head) {
+//         can_frame_t f = s_rxQueue.buf[s_rxQueue.tail];
+//         s_rxQueue.tail = (uint16_t)((s_rxQueue.tail + 1U) % CAN_RX_QUEUE_SIZE);
+
+//         can_tx_bytes(f.u32Id & CAN_EXT_ID_MASK, f.au8Data, f.u8Dlc);  /* 回显 */
+//     }
+// }

@@ -1,102 +1,45 @@
 #include "servo.h"
 
-/* ================= 接收环形缓冲(USART3, IRQ137) ================= */
-#define SERVO_RX_BUF_MAX    (128U)      /* 必须是 2 的幂 */
-#define SERVO_RX_BUF_MASK   (SERVO_RX_BUF_MAX - 1U)
+/* ============================================================================
+ * 硬件映射: USART3 --- PB14(TX) --> 舵机信号线, PB13(RX) 预留回读
+ * ========================================================================== */
 
-static volatile char     s_rx_buf[SERVO_RX_BUF_MAX];
-static volatile uint32_t s_rx_head = 0U;
-static volatile uint32_t s_rx_tail = 0U;
+#define SERVO_USART             (CM_USART3)
 
-/* IRQ137 分派 -> 接收完成(函数名不能改) */
-void USART3_RxFull_IrqHandler(void)
+/* ------------------------- 底层: 阻塞发送 ------------------------- */
+
+static void servo_putc(uint8_t c)
 {
-    uint8_t  c;
-    uint32_t tail;
-
-    (void)CM_USART3->SR;                 /* 清 ORE/FE/PE 等错误标志 */
-
-    if (USART_GetStatus(CM_USART3, USART_FLAG_RX_FULL)) {
-        c    = (uint8_t)USART_ReadData(CM_USART3);
-        tail = (s_rx_tail + 1U) & SERVO_RX_BUF_MASK;
-        if (tail != s_rx_head) {
-            s_rx_buf[s_rx_tail] = (char)c;
-            s_rx_tail = tail;
-        }
+    /* 等待发送数据寄存器空 */
+    while (USART_GetStatus(SERVO_USART, USART_FLAG_TX_EMPTY) == RESET) {
     }
+    USART_WriteData(SERVO_USART, c);
 }
 
-/* IRQ137 分派 -> 接收错误(函数名不能改) */
-void USART3_RxError_IrqHandler(void)
-{
-    (void)CM_USART3->SR;
-    (void)USART_ReadData(CM_USART3);
-}
-
-int16_t servo_recv_byte(void)
-{
-    uint8_t c;
-
-    if (s_rx_head == s_rx_tail) {
-        return -1;
-    }
-    c = (uint8_t)s_rx_buf[s_rx_head];
-    s_rx_head = (s_rx_head + 1U) & SERVO_RX_BUF_MASK;
-    return (int16_t)c;
-}
-
-/* 空闲超时收集: 收到 max 字节 或 连续 timeout_ms 无新数据 则返回 */
-uint16_t servo_recv(uint8_t *dst, uint16_t max, uint32_t timeout_ms)
-{
-    uint16_t n = 0U;
-    uint32_t idle = 0U;
-    int16_t  c;
-
-    while (n < max) {
-        c = servo_recv_byte();
-        if (c >= 0) {
-            dst[n++] = (uint8_t)c;
-            idle = 0U;
-            continue;
-        }
-        if (++idle >= timeout_ms) {
-            break;
-        }
-        DDL_DelayMS(1U);
-    }
-    return n;
-}
-
-void servo_rx_flush(void)
-{
-    s_rx_head = s_rx_tail;
-}
-
-/* ================= 底层: USART3 阻塞发送 ================= */
-
-/* 等待 TXE 后写入一个字节 */
-static void usart3_putc(uint8_t c)
-{
-    while (USART_GetStatus(CM_USART3, USART_FLAG_TX_EMPTY) == RESET) {
-    }
-    USART_WriteData(CM_USART3, c);
-}
-
-/* 发送 len 字节, 并等待最后一字节移位发送完成 */
-void servo_send_raw(const uint8_t *data, uint16_t len)
+void servo_send(const uint8_t *data, uint16_t len)
 {
     uint16_t i;
-
     for (i = 0U; i < len; i++) {
-        usart3_putc(data[i]);
+        servo_putc(data[i]);
     }
-    while (USART_GetStatus(CM_USART3, USART_FLAG_TX_CPLT) == RESET) {
+    /* 等待最后一字节移位发送完成 */
+    while (USART_GetStatus(SERVO_USART, USART_FLAG_TX_CPLT) == RESET) {
     }
 }
 
-/* ================= 协议组帧 ================= */
+void servo_send_str(const char *str)
+{
+    while (*str != '\0') {
+        servo_putc((uint8_t)(*str));
+        str++;
+    }
+    while (USART_GetStatus(SERVO_USART, USART_FLAG_TX_CPLT) == RESET) {
+    }
+}
 
-/* 将 val 按 digits 位十进制补零写入 dst, 返回写后的指针 */
+/* ------------------------- 协议组帧 ------------------------- */
+
+/* 把 val 按 digits 位十进制补零写入 dst, 返回写后的指针 */
 static char *servo_fmt_digits(char *dst, uint32_t val, uint8_t digits)
 {
     uint8_t i;
@@ -107,7 +50,7 @@ static char *servo_fmt_digits(char *dst, uint32_t val, uint8_t digits)
     return &dst[digits];
 }
 
-/* 发送 '#ID P 命令 !' 形式的指令 */
+/* 发送 '#XXXP<cmd>!' 形式指令 */
 static void servo_send_cmd(uint8_t id, const char *cmd)
 {
     char buf[16];
@@ -115,13 +58,13 @@ static void servo_send_cmd(uint8_t id, const char *cmd)
     const char *q;
 
     *p++ = '#';
-    p = servo_fmt_digits(p, id, 3);
+    p = servo_fmt_digits(p, (uint32_t)id, 3);
     *p++ = 'P';
     for (q = cmd; *q != '\0'; q++) {
         *p++ = *q;
     }
     *p++ = '!';
-    servo_send_raw((const uint8_t *)buf, (uint16_t)(p - buf));
+    servo_send((const uint8_t *)buf, (uint16_t)(p - buf));
 }
 
 /* 位置控制帧 '#XXXPYYYYTZZZZ!' */
@@ -131,61 +74,61 @@ static void servo_move_frame(uint8_t id, uint16_t pwm, uint16_t time_ms)
     char *p = buf;
 
     *p++ = '#';
-    p = servo_fmt_digits(p, id, 3);
+    p = servo_fmt_digits(p, (uint32_t)id, 3);
     *p++ = 'P';
-    p = servo_fmt_digits(p, pwm, 4);
+    p = servo_fmt_digits(p, (uint32_t)pwm, 4);
     *p++ = 'T';
-    p = servo_fmt_digits(p, time_ms, 4);
+    p = servo_fmt_digits(p, (uint32_t)time_ms, 4);
     *p++ = '!';
-    servo_send_raw((const uint8_t *)buf, (uint16_t)(p - buf));
+    servo_send((const uint8_t *)buf, (uint16_t)(p - buf));
 }
 
-/* ================= 对外接口 ================= */
+/* ------------------------- 硬件初始化 ------------------------- */
 
 void servo_init(void)
 {
     stc_usart_uart_init_t stcUartInit;
+    stc_gpio_init_t stcGpioInit;
     float32_t f32Err;
 
-    /* 1. 使能 USART3 时钟 */
+    /* 1. 使能 USART3 外设时钟 */
     LL_PERIPH_WE(LL_PERIPH_FCG);
     FCG_Fcg1PeriphClockCmd(FCG1_PERIPH_USART3, ENABLE);
     LL_PERIPH_WP(LL_PERIPH_FCG);
 
-    /* 2. GPIO 复用 PB13=USART3_RX / PB14=USART3_TX 已在 main.c App_PortCfg 配置 */
+    /* 2. PB13=USART3_RX(FUNC33), PB14=USART3_TX(FUNC32) */
+    (void)GPIO_StructInit(&stcGpioInit);
+    stcGpioInit.u16PinAttr = PIN_ATTR_DIGITAL;
+    (void)GPIO_Init(GPIO_PORT_B, (GPIO_PIN_13 | GPIO_PIN_14), &stcGpioInit);
+    GPIO_SetFunc(GPIO_PORT_B, GPIO_PIN_13, GPIO_FUNC_33);   /* RX 预留 */
+    GPIO_SetFunc(GPIO_PORT_B, GPIO_PIN_14, GPIO_FUNC_32);   /* TX 接舵机 */
 
-    /* 3. 配置 USART3: 115200 / 8bit / 1停止位 / 无校验 */
-    USART_DeInit(CM_USART3);
+    /* 3. USART3: 115200 / 8bit / 1停止位 / 无校验 */
+    USART_DeInit(SERVO_USART);
     (void)USART_UART_StructInit(&stcUartInit);
-    stcUartInit.u32Baudrate = SERVO_BUS_BAUDRATE;
-    (void)USART_UART_Init(CM_USART3, &stcUartInit, &f32Err);
+    stcUartInit.u32Baudrate = SERVO_BAUDRATE;
+    (void)USART_UART_Init(SERVO_USART, &stcUartInit, &f32Err);
 
-    /* 4. 使能 TX / RX 功能 */
-    USART_FuncCmd(CM_USART3, USART_TX | USART_RX, ENABLE);
-
-    /* 5. 接收走共享中断(USART3_RI -> INT137); 发送用阻塞, 不需要 TXE 中断 */
-    (void)INTC_ShareIrqCmd(INT_SRC_USART3_RI, ENABLE);
-    NVIC_ClearPendingIRQ(INT137_IRQn);
-    NVIC_SetPriority(INT137_IRQn, DDL_IRQ_PRIO_01);
-    NVIC_EnableIRQ(INT137_IRQn);
-
-    /* 6. 使能接收中断(RIE 覆盖接收完成与接收错误) */
-    USART_FuncCmd(CM_USART3, USART_INT_RX, ENABLE);
-
-    servo_rx_flush();
+    /* 4. 只使能发送(当前不接收回读) */
+    USART_FuncCmd(SERVO_USART, USART_TX, ENABLE);
 }
+
+/* ------------------------- 对外接口 ------------------------- */
 
 void servo_move(uint8_t id, uint16_t pwm, uint16_t time_ms)
 {
-    if (pwm < SERVO_PWM_MIN) pwm = SERVO_PWM_MIN;
-    if (pwm > SERVO_PWM_MAX) pwm = SERVO_PWM_MAX;
+    if (pwm < SERVO_PWM_MIN)      { pwm = SERVO_PWM_MIN; }
+    if (pwm > SERVO_PWM_MAX)      { pwm = SERVO_PWM_MAX; }
+    if (time_ms > SERVO_TIME_MAX) { time_ms = SERVO_TIME_MAX; }
     servo_move_frame(id, pwm, time_ms);
 }
 
-/* 角度(0~270°) -> PWM(500~2500) 线性映射, 135°≈1500 */
+/* 角度(0~270°) -> PWM(500~2500) 线性映射, 135°≈1500 (270°模式) */
 static uint16_t servo_angle_to_pwm(uint16_t angle)
 {
-    if (angle > 270U) angle = 270U;
+    if (angle > 270U) {
+        angle = 270U;
+    }
     return (uint16_t)(SERVO_PWM_MIN +
            ((uint32_t)angle * (SERVO_PWM_MAX - SERVO_PWM_MIN)) / 270U);
 }
@@ -203,39 +146,45 @@ void servo_move_broadcast(uint16_t pwm, uint16_t time_ms)
 void servo_move_multi(const servo_cmd_t *cmds, uint8_t n)
 {
     uint8_t i;
-    uint8_t ch;
+    uint8_t brace;
 
-    if (n == 0U) {
+    if ((cmds == 0) || (n == 0U)) {
         return;
     }
-    /* 2条以上叠加需要 {} 包裹 */
-    if (n >= 2U) {
-        ch = '{';
-        servo_send_raw(&ch, 1U);
+    if (n >= 2U) {                     /* 2 条及以上需 {} 包裹 */
+        brace = '{';
+        servo_send(&brace, 1U);
     }
     for (i = 0U; i < n; i++) {
-        servo_move_frame(cmds[i].id, cmds[i].pwm, cmds[i].time_ms);
+        uint16_t pwm = cmds[i].pwm;
+        uint16_t t   = cmds[i].time_ms;
+        if (pwm < SERVO_PWM_MIN)      { pwm = SERVO_PWM_MIN; }
+        if (pwm > SERVO_PWM_MAX)      { pwm = SERVO_PWM_MAX; }
+        if (t > SERVO_TIME_MAX)       { t = SERVO_TIME_MAX; }
+        servo_move_frame(cmds[i].id, pwm, t);
     }
     if (n >= 2U) {
-        ch = '}';
-        servo_send_raw(&ch, 1U);
+        brace = '}';
+        servo_send(&brace, 1U);
     }
 }
 
-void servo_unlock_torque(uint8_t id)   { servo_send_cmd(id, "ULK"); }
-void servo_lock_torque(uint8_t id)     { servo_send_cmd(id, "ULR"); }
-void servo_stop(uint8_t id)            { servo_send_cmd(id, "DST"); }
-void servo_pause(uint8_t id)           { servo_send_cmd(id, "DPT"); }
-void servo_resume(uint8_t id)          { servo_send_cmd(id, "DCT"); }
-void servo_factory_reset(uint8_t id)   { servo_send_cmd(id, "CLE"); }
+void servo_unlock_torque(uint8_t id)  { servo_send_cmd(id, "ULK"); }
+void servo_lock_torque(uint8_t id)    { servo_send_cmd(id, "ULR"); }
+void servo_stop(uint8_t id)           { servo_send_cmd(id, "DST"); }
+void servo_pause(uint8_t id)          { servo_send_cmd(id, "DPT"); }
+void servo_resume(uint8_t id)         { servo_send_cmd(id, "DCT"); }
+void servo_calib_mid(uint8_t id)      { servo_send_cmd(id, "SCK"); }
+void servo_factory_reset(uint8_t id)  { servo_send_cmd(id, "CLE"); }
 
 void servo_set_mode(uint8_t id, uint8_t mode)
 {
-    char cmd[4];
-    if (mode < 1U) mode = 1U;
-    if (mode > 8U) mode = 8U;
+    char cmd[5];
+    if (mode < SERVO_MODE_270_CW)       { mode = SERVO_MODE_270_CW; }
+    if (mode > SERVO_MODE_360_TIME_CCW) { mode = SERVO_MODE_360_TIME_CCW; }
     cmd[0] = 'M'; cmd[1] = 'O'; cmd[2] = 'D';
     cmd[3] = (char)('0' + mode);
+    cmd[4] = '\0';
     servo_send_cmd(id, cmd);
 }
 
@@ -244,40 +193,49 @@ void servo_set_id(uint8_t old_id, uint8_t new_id)
     char cmd[8];
     char *p = cmd;
     *p++ = 'I'; *p++ = 'D';
-    p = servo_fmt_digits(p, new_id, 3);
+    p = servo_fmt_digits(p, (uint32_t)new_id, 3);
     *p = '\0';
-    servo_send_cmd(old_id, cmd);
+    servo_send_cmd(old_id, cmd);   /* 注意: 改 ID 时舵机不要串联 */
 }
 
 void servo_set_baud(uint8_t id, uint8_t code)
 {
     char cmd[4];
     /* 1-9600 2-19200 3-38400 4-57600 5-115200 6-128000 7-256000 8-1000000 */
-    if (code < 1U) code = 1U;
-    if (code > 8U) code = 8U;
+    if (code < 1U) { code = 1U; }
+    if (code > 8U) { code = 8U; }
     cmd[0] = 'B'; cmd[1] = 'D';
     cmd[2] = (char)('0' + code);
+    cmd[3] = '\0';
     servo_send_cmd(id, cmd);
 }
 
-void servo_calib_mid(uint8_t id) { servo_send_cmd(id, "SCK"); }
-
-void servo_start(void)
+void servo_boot(void)
 {
-    servo_move_broadcast(1500, 300);
-    DDL_DelayMS(500);
-    servo_move_broadcast(2200, 300);
-    DDL_DelayMS(500);
-    servo_move_broadcast(1500, 300);
-    DDL_DelayMS(500);
+    /* 供电直接上电, 舵机内部自检需要时间 */
+    DDL_DelayMS(100);
+
+    /* 释放扭力 -> 柔和回中位 -> 恢复扭力锁定 */
+    servo_unlock_torque(SERVO_ID_BROADCAST);
+    DDL_DelayMS(200);
+    servo_move_broadcast(SERVO_PWM_MID, 500);
+    DDL_DelayMS(600);
+    servo_lock_torque(SERVO_ID_BROADCAST);
 }
 
-void servo_initial(void)
+void servo_set_mid_here(uint8_t id)
 {
-    servo_unlock_torque(255);
+    servo_unlock_torque(id);        /* PULK: 释放扭力, 此时可手动摆正 */
+    DDL_DelayMS(200);
+    servo_calib_mid(id);            /* PSCK: 把当前位置标定为 1500 中值 */
+    DDL_DelayMS(200);
+    servo_lock_torque(id);          /* PULR: 恢复扭力, 锁在当前位置 */
+}
+
+void servo_run(void)
+{
+    servo_move(SERVO_ID_DEFAULT, 1500, 200);
     DDL_DelayMS(300);
-    servo_calib_mid(255);
-    DDL_DelayMS(300);
-    servo_lock_torque(255);
+    servo_move(SERVO_ID_DEFAULT, 2200, 200);
     DDL_DelayMS(300);
 }

@@ -47,7 +47,7 @@ static void INT_SRC_CAN_INT_IrqCallback(void);
 /* INT_SRC_ADC1_EOCA Callback. */
 static void INT_SRC_ADC1_EOCA_IrqCallback(void);
 /* Configures ADC. */
-static void App_ADCCfg(void);
+//static void App_ADCCfg(void);
 /* Configures USARTx. */
 static void App_USARTxCfg(void);
 /* Configures CAN. */
@@ -149,14 +149,14 @@ static void App_IntCfg(void)
     stc_irq_signin_config_t stcIrq;
 
     /* IRQ sign-in */
-    stcIrq.enIntSrc = INT_SRC_CAN_INT;
-    stcIrq.enIRQn = INT122_IRQn;
-    stcIrq.pfnCallback = &INT_SRC_CAN_INT_IrqCallback;
-    (void)INTC_IrqSignIn(&stcIrq);
-    /* NVIC config */
-    NVIC_ClearPendingIRQ(INT122_IRQn);
-    NVIC_SetPriority(INT122_IRQn, DDL_IRQ_PRIO_15);
-    NVIC_EnableIRQ(INT122_IRQn);
+    // stcIrq.enIntSrc = INT_SRC_CAN_INT;
+    // stcIrq.enIRQn = INT122_IRQn;
+    // stcIrq.pfnCallback = &INT_SRC_CAN_INT_IrqCallback;
+    // (void)INTC_IrqSignIn(&stcIrq);
+    // /* NVIC config */
+    // NVIC_ClearPendingIRQ(INT122_IRQn);
+    // NVIC_SetPriority(INT122_IRQn, DDL_IRQ_PRIO_15);
+    // NVIC_EnableIRQ(INT122_IRQn);
 
     /* IRQ sign-in */
     stcIrq.enIntSrc = INT_SRC_ADC1_EOCA;
@@ -169,6 +169,8 @@ static void App_IntCfg(void)
     NVIC_EnableIRQ(INT116_IRQn);
 
 }
+
+
 
 /**
  * @brief  Main function of the project
@@ -186,16 +188,48 @@ int main(void)
     //Int Config
     App_IntCfg();
     //ADC Config
-    App_ADCCfg();
+    //App_ADCCfg();
     //USARTx Config
     App_USARTxCfg();
     //CAN Config
-    App_CANCfg();
+    //App_CANCfg();
+    can_init(); 
+    
+
+    uart_driver_init();
+    check_init();         
+
+    // motor_init();
+    // motor_enable(1);
+    // DDL_DelayMS(200);
+    // motor_limit_home();
+
+    servo_init();
+    
+    //servo_set_mid_here(SERVO_ID_BROADCAST); 
+    DDL_DelayMS(100);
+
 
     /* Register write protected for some required peripherals. */
     LL_PERIPH_WP(LL_PERIPH_ALL);
     for (;;) {
+        //motor_limit_task();     
+        //servo_run();
+        // servo_move(SERVO_ID_DEFAULT, 1500, 500);    /* 另一端 */
+        // DDL_DelayMS(1000);   
+        //check_task();   
+        can_poll();  
+        DDL_DelayMS(100);
         
+                 
+
+
+
+        // static const uint8_t frame[] = { 0x01U, 0xF3U, 0xABU, 0x01U, 0x00U, 0x6BU };
+        // uart_send_data(UART_IDX_0, frame, (uint16_t)sizeof(frame));
+        // DDL_DelayMS(100);         
+        
+
     }
 }
 

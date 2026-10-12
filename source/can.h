@@ -4,7 +4,7 @@
 #include "main.h"
 
 /* ================= 设备配置 ================= */
-#define SLAVE_ADDR             (8U)    /* 1~15 */
+#define SLAVE_ADDR             (1U)    /* 1~3 */
 
 /* ================= 节点 / 报文 ID 配置 ================= */
 #define CAN_BROADCAST_ID     (0x10000000U)           /* 广播扩展帧 ID */
@@ -26,6 +26,9 @@ void can_init(void);
 void can_poll(void);                                     /* 主循环: 处理接收队列 */
 void can_tx_bytes(uint32_t ext_id, const uint8_t *p, uint8_t n);     /* 扩展帧(>8B 自动分包) */
 void can_tx_bytes_std(uint32_t std_id, const uint8_t *p, uint8_t n); /* 标准帧 */
-void can_report_overcurrent(void);                       /* 过流上报(供 check.c 调用) */
+
+
+/* 电流上报 ID(扩展帧) */
+#define CAN_CURRENT_ID       (0x0100U | SLAVE_ADDR)   /* 板子 -> 主机: 电流值 */
 
 #endif /* __CAN_H__ */

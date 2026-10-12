@@ -3,11 +3,21 @@
 
 #include "main.h"
 
+/* ============================================================================
+ * Emm 闭环步进/伺服电机 总线驱动 (基于 source/uart.c)
+ * ----------------------------------------------------------------------------
+ * 总线:  USART1 (PA04=TX, PA03=RX), 由 uart_driver_init() 初始化
+ * 帧:    addr + code + data... + check
+ * 默认:  地址 1, 校验 0x6B, 3200 脉冲/圈
+ * 限位:  PB4 (低电平=触发)
+ * 说明:  移植自 app/motor.c, 已适配本工程
+ * ========================================================================== */
+
 #define MOTOR_ADDR_DEFAULT      (1U)    /* 出厂默认地址 */
 #define MOTOR_ADDR_BROADCAST    (0U)    /* 广播地址 */
-#define MOTOR_CHECK_BYTE        (0x6BU) /* 出厂默认校验 */
+#define MOTOR_CHECK_BYTE        (0x6B)  /* 出厂默认校验 */
 
-#define MOTOR_PULSES_PER_REV    (3200U) /* Emm: 3200脉冲/圈 */
+#define MOTOR_PULSES_PER_REV    (3200U) /* Emm: 3200 脉冲/圈 */
 #define MOTOR_MAX_RPM           (3000U)
 
 /* FD 位置模式 运动模式 */
@@ -20,13 +30,16 @@
 #define MOTOR_HOME_DIR          (1U)    /* 单圈方向回零 */
 #define MOTOR_HOME_COLLIDE      (2U)    /* 无限位碰撞回零 */
 
-/* ---- 底层(可用来发任意命令/广播) ---- */
+/* ---- 初始化(配置限位输入 GPIO, 用限位回零时调用) ---- */
+void motor_init(void);
+
+/* ---- 底层(可发任意命令/广播) ---- */
 void motor_tx(uint8_t addr, uint8_t code, const uint8_t *data, uint8_t len);
 
 /* ---- 地址/校验配置 ---- */
-void    motor_set_addr(uint8_t addr);
+void motor_set_addr(uint8_t addr);
 uint8_t motor_get_addr(void);
-void    motor_set_check(uint8_t chk);
+void motor_set_check(uint8_t chk);
 
 /* ---- 通用控制(发往当前地址) ---- */
 void motor_enable(uint8_t en);            /* F3: 1=使能锁轴 0=失能松轴 */
@@ -49,47 +62,42 @@ void motor_go(int32_t pulse);             /* FC: 有符号脉冲运动 */
 /* ---- Emm 速度模式 F6 ---- */
 void motor_speed(int8_t dir, uint16_t rpm, uint8_t acc);  /* dir: 0=正 1=反 */
 
-/* ---- 读取(仅发送查询, 返回帧用 uart_recv_byte(UART_IDX_0) 取) ---- */
+/* ---- 读取(仅发送查询) ---- */
 void motor_req_position(void);            /* 36 */
 
 /* ---- 角度/脉冲换算(1.8°电机/16细分) ---- */
 int32_t motor_deg_to_pulse(int32_t deg_x100);  /* deg_x100: 角度*100, 返回脉冲 */
 
-/* ================= IO: 限位开关(PB4) =================
- * PB4 默认是 NJTRST, main.c 已调用 GPIO_SetDebugPort(GPIO_PIN_TRST, DISABLE)
- * 输入上拉, 低电平 = 触发
+/* ---- 限位开关回零 ----
+ * 新板限位输入: PB4 (低电平=触发)
+ * 注意: PB4 默认是 TRST(JTAG), 用作普通 IO 需先关闭调试口
  */
-#define MOTOR_LIMIT_SPEED       (200U)   /* 回零逼近速度 RPM(慢速, 防撞坏) */
-#define MOTOR_LIMIT_ACC         (200U)   /* 加速度档 */
-#define MOTOR_LIMIT_TIMEOUT_MS  (10000U) /* 超时10s, 防限位失效一直转 */
+#define MOTOR_LIMIT_PORT        (GPIO_PORT_B)   /* 限位输入端口 */
+#define MOTOR_LIMIT_PIN         (GPIO_PIN_04)   /* 限位输入引脚, 低电平=触发 */
+#define MOTOR_LIMIT_SPEED       (200U)          /* 逼近速度 RPM(慢速防撞) */
+#define MOTOR_LIMIT_ACC         (200U)          /* 加速度档 */
+#define MOTOR_LIMIT_TIMEOUT_MS  (10000U)        /* 超时 10s 防限位失效 */
 
-void    motor_io_init(void);              /* PB4 限位输入初始化(上拉) */
-uint8_t motor_limit_home(void);           /* 返回1=回零成功 0=超时失败 */
-void    motor_limit_task(void);           /* 限位沿检测: 主循环每轮调用 */
+uint8_t motor_limit_home(void);          /* 返回1=回零成功 0=超时失败 */
+void motor_limit_task(void);             /* 主循环每轮调用: 限位沿检测 */
 
-/* ================= IO: 轨道凸起计数(PB12, EXTINT12 -> IRQ128) =================
- * 用于位置校准: 轨道上固定位置放凸起, 传感器每经过一个凸起产生一个脉冲
- * 方向由最近一次 motor_move*/motor_speed 的 dir 参数决定(开环加减)
- */
-#define MOTOR_BUMP_SPACING_MM   (20U)    /* TODO: 实测凸起间距(mm), 必须按实际填写 */
-#define MOTOR_BUMP_ACTIVE_EDGE  (EXTINT_TRIG_FALLING) /* TODO: 按传感器极性改 RISING */
-
-void    motor_bump_init(void);            /* PB12 + EXTINT12 + IRQ128 初始化 */
-void    motor_bump_reset(void);           /* 计数清零(校准起点) */
-int32_t motor_bump_pos(void);             /* 有符号凸起计数(方向感知) */
-int32_t motor_bump_to_pulse(uint32_t bumps); /* 凸起数 -> 电机脉冲 */
-void    motor_bump_set_dir(int8_t dir);   /* 记录运动方向(供凸起计数开环加减) */
-
-
-/* ===== 机械参数: 16齿 S3M 同步轮 =====
+/* ===== 机械参数(示例: 16齿 S3M 同步轮, 按实际修改) =====
  * S3M 节距 3.000mm -> 每圈皮带行程 = 16 * 3 = 48mm
  * 电机 3200 脉冲/圈 -> 10 圈 = 32000 脉冲 = 480mm = 48cm
  */
 #define PULLEY_MM_PER_REV       (48U)     /* 皮带每圈行程 mm */
-
-#define POS_RPM                 (600U)    /* 运行速度 */
-#define POS_ACC                 (100U)    /* 加速度档 */
+#define POS_48CM_MM             (480U)
+#define POS_48CM_PULSE          ((int32_t)(((uint32_t)POS_48CM_MM * MOTOR_PULSES_PER_REV) \
+                                           / PULLEY_MM_PER_REV))
+#define POS_RPM                 (600U)
+#define POS_ACC                 (100U)
+#define POS_WAIT_MS             (1500U)
 
 int32_t motor_mm_to_pulse(uint32_t mm);   /* 皮带行程 mm -> 电机脉冲 */
+
+#define POS_863MM_MM            (863U)
+#define POS_863MM_PULSE         ((int32_t)(((uint32_t)POS_863MM_MM * MOTOR_PULSES_PER_REV) \
+                                           / PULLEY_MM_PER_REV))
+#define HOME_SETTLE_MS          (500U)    /* 回零后机械稳定 */
 
 #endif /* __MOTOR_H__ */
