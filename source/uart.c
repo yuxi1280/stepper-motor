@@ -208,6 +208,14 @@ int16_t uart_recv_byte(uart_idx_t idx)
     }
     return -1;
 }
+uint16_t uart_rx_count(uart_idx_t idx)
+{
+    if (idx == UART_IDX_0) {
+        return (uint16_t)((g_uart0.r_buf->tail - g_uart0.r_buf->head) &
+                          (UART_BUF_RX_MAX - 1U));
+    }
+    return 0U;
+}
 
 uint16_t uart_recv(uart_idx_t idx, uint8_t *dst, uint16_t len)
 {
@@ -238,5 +246,3 @@ void uart_driver_init(void)
     uart_init(&g_uart0);
     hw_init();
 }
-
-

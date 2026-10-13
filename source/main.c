@@ -172,6 +172,7 @@ static void App_IntCfg(void)
 
 
 
+
 /**
  * @brief  Main function of the project
  * @param  None
@@ -199,27 +200,27 @@ int main(void)
     uart_driver_init();
     check_init();         
 
-    // motor_init();
-    // motor_enable(1);
-    // DDL_DelayMS(200);
-    // motor_limit_home();
+    motor_init();
+    motor_enable(1);
+    DDL_DelayMS(200);
+    //motor_limit_home();
 
     servo_init();
     
     //servo_set_mid_here(SERVO_ID_BROADCAST); 
-    DDL_DelayMS(100);
+    //DDL_DelayMS(100);
 
 
     /* Register write protected for some required peripherals. */
     LL_PERIPH_WP(LL_PERIPH_ALL);
     for (;;) {
-        //motor_limit_task();     
+        motor_limit_task();     
+        motor_rx_task(); 
         //servo_run();
         // servo_move(SERVO_ID_DEFAULT, 1500, 500);    /* 另一端 */
         // DDL_DelayMS(1000);   
         //check_task();   
-        can_poll();  
-        DDL_DelayMS(100);
+        can_poll();       
         
                  
 

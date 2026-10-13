@@ -1,4 +1,5 @@
 #include "can.h"
+#include "motor.h"
 #include <string.h>
 
 /* ================= 内部帧结构 ================= */
@@ -171,6 +172,29 @@ static void can_handle_interior_query(const can_frame_t *f)
     can_tx_bytes(CAN_NODE_ID, ack, sizeof(ack));
 }
 
+/* 电机控制命令: 0x01 归零 / 0x02 去第 n 个工位 */
+static void can_handle_motor_cmd(const can_frame_t *f)
+{
+    if (f->u8Dlc < 1U) {
+        return;
+    }
+
+    switch (f->au8Data[0]) {
+        case CAN_CMD_HOME:                       /* 归零 */
+            motor_limit_home();
+            break;
+
+        case CAN_CMD_GOTO:                       /* 去第 n 个工位 */
+            if (f->u8Dlc >= 2U) {
+                motor_goto_point(f->au8Data[1]);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
 /* ================= 主循环处理 ================= */
 void can_poll(void)
 {
@@ -179,6 +203,7 @@ void can_poll(void)
         s_rxQueue.tail = (uint16_t)((s_rxQueue.tail + 1U) % CAN_RX_QUEUE_SIZE);
         /* TODO: 根据 f.u32Id / f.au8Data 解析协议, 再调用 motor_/servo_ 接口 */
         can_handle_interior_query(&f);
+        can_handle_motor_cmd(&f);  
     }
 }
 

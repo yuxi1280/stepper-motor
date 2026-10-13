@@ -31,4 +31,8 @@ void can_tx_bytes_std(uint32_t std_id, const uint8_t *p, uint8_t n); /* 标准�
 /* 电流上报 ID(扩展帧) */
 #define CAN_CURRENT_ID       (0x0100U | SLAVE_ADDR)   /* 板子 -> 主机: 电流值 */
 
+/* 电机控制命令(主机 -> 板子) */
+#define CAN_CMD_HOME         (0x01U)   /* 归零:       data = {0x01} */
+#define CAN_CMD_GOTO         (0x02U)   /* 去工位:     data = {0x02, n} , n 从 1 开始 */
+
 #endif /* __CAN_H__ */

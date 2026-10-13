@@ -10,8 +10,15 @@
  * 帧:    addr + code + data... + check
  * 默认:  地址 1, 校验 0x6B, 3200 脉冲/圈
  * 限位:  PB4 (低电平=触发)
- * 说明:  移植自 app/motor.c, 已适配本工程
  * ========================================================================== */
+
+ /* ===== 工位定义(归零后) =====
+ * 第 1 个点距零点 10mm, 之后每点比前一个远 17mm:
+ *   n=1 -> 10mm, n=2 -> 27mm, n=3 -> 44mm, ...
+ */
+#define POS_FIRST_MM         (10U)   /* 第一个工位距零点 mm */
+#define POS_STEP_MM          (17U)   /* 工位间距 mm */
+
 
 #define MOTOR_ADDR_DEFAULT      (1U)    /* 出厂默认地址 */
 #define MOTOR_ADDR_BROADCAST    (0U)    /* 广播地址 */
@@ -90,7 +97,7 @@ void motor_limit_task(void);             /* 主循环每轮调用: 限位沿检�
 #define POS_48CM_PULSE          ((int32_t)(((uint32_t)POS_48CM_MM * MOTOR_PULSES_PER_REV) \
                                            / PULLEY_MM_PER_REV))
 #define POS_RPM                 (600U)
-#define POS_ACC                 (100U)
+#define POS_ACC                 (200U)
 #define POS_WAIT_MS             (1500U)
 
 int32_t motor_mm_to_pulse(uint32_t mm);   /* 皮带行程 mm -> 电机脉冲 */
@@ -99,5 +106,71 @@ int32_t motor_mm_to_pulse(uint32_t mm);   /* 皮带行程 mm -> 电机脉冲 */
 #define POS_863MM_PULSE         ((int32_t)(((uint32_t)POS_863MM_MM * MOTOR_PULSES_PER_REV) \
                                            / PULLEY_MM_PER_REV))
 #define HOME_SETTLE_MS          (500U)    /* 回零后机械稳定 */
+
+void motor_goto_point(uint8_t n);   /* 去第 n 个工位(n 从 1 开始), 内部换算脉冲 */
+/* ================= 回读(自由协议: 地址 + 功能码 + 数据 + 校验) ================= */
+#define MOTOR_RX_TIMEOUT_MS   (50U)   /* 单次读取默认超时(ms) */
+#define MOTOR_RX_FRAME_MAX    (8U)    /* 手册里最长返回帧 8 字节 */
+#define MOTOR_ERR_TIMEOUT     (INT32_MIN)  /* 读取失败的返回值 */
+
+/* 电机状态标志(0x3A) */
+#define MOTOR_ST_OAC_TF       (0x80U) /* 掉电标志 */
+#define MOTOR_ST_ESI_RF       (0x20U) /* 右限位 */
+#define MOTOR_ST_ESI_LF       (0x10U) /* 左限位 */
+#define MOTOR_ST_CGP_TF       (0x08U) /* 堵转保护 */
+#define MOTOR_ST_CGI_TF       (0x04U) /* 堵转标志 */
+#define MOTOR_ST_PRF_TF       (0x02U) /* 位置到达 */
+#define MOTOR_ST_ENS_TF       (0x01U) /* 使能状态 */
+
+/* 回零状态标志(0x3B/0x3C) */
+#define MOTOR_ORG_ENC_RDY     (0x01U) /* 编码器正常 */
+#define MOTOR_ORG_CAL_RDY     (0x02U) /* 已校准 */
+#define MOTOR_ORG_SF          (0x04U) /* 正在回零 */
+#define MOTOR_ORG_CF          (0x08U) /* 回零失败 */
+#define MOTOR_ORG_OTP_TF      (0x10U) /* 过热保护 */
+#define MOTOR_ORG_OCP_TF      (0x20U) /* 过流保护 */
+
+/* 0x36 实时位置返回值语义(按实测二选一) */
+#define MOTOR_POS_MODE_PULSE    (0U)  /* 返回脉冲数, 3200/圈, 可多圈 */
+#define MOTOR_POS_MODE_ENCODER  (1U)  /* 返回单圈编码器值, 65536=360°(Emm固件手册写法) */
+#define MOTOR_POS_MODE          (MOTOR_POS_MODE_ENCODER)
+
+typedef struct {
+    uint16_t fw_ver;      /* 例 200 -> V2.0.0 */
+    uint8_t  hw_series;   /* 0=X 系列 1=Y 系列 */
+    uint8_t  hw_type;     /* 3=35 / 4=42 / 5=57 */
+    uint8_t  hw_ver;      /* 例 14 -> V2.0 */
+} motor_version_t;
+
+/* ---- 接收底层 ---- */
+void     motor_flush_rx(void);                      /* 丢弃接收缓冲里的残留 */
+uint16_t motor_rx_available(void);                  /* 缓冲里还有多少字节 */
+void     motor_rx_task(void);                       /* 主循环调用: 消费主动返回帧 */
+
+/* ---- 读取接口(失败返回负数/0xFF) ---- */
+int32_t  motor_read_input_pulses(uint32_t timeout_ms);    /* 0x32 输入脉冲数(有符号) */
+int32_t  motor_read_position_raw(uint32_t timeout_ms);    /* 0x36 实时位置原始值 */
+int32_t  motor_read_position_mdeg(uint32_t timeout_ms);   /* 0x36 换算成 0.001° */
+int32_t  motor_read_target_raw(uint32_t timeout_ms);      /* 0x33 目标位置 */
+int32_t  motor_read_pos_error_raw(uint32_t timeout_ms);   /* 0x37 位置误差 */
+int16_t  motor_read_speed_rpm(uint32_t timeout_ms);       /* 0x35 实时转速(失败 INT16_MIN) */
+uint16_t motor_read_enc_raw(uint32_t timeout_ms);         /* 0x31 编码器值(失败 0xFFFF) */
+uint8_t  motor_read_status(uint32_t timeout_ms);          /* 0x3A 状态标志(失败 0xFF) */
+uint8_t  motor_read_home_status(uint32_t timeout_ms);     /* 0x3B 回零状态 */
+uint8_t  motor_read_temp_c(uint32_t timeout_ms);          /* 0x39 驱动温度 */
+uint16_t motor_read_bus_volt_mv(uint32_t timeout_ms);     /* 0x24 总线电压 mV */
+uint16_t motor_read_bus_current_ma(uint32_t timeout_ms);  /* 0x26 总线电流 mA */
+uint16_t motor_read_phase_current_ma(uint32_t timeout_ms);/* 0x27 相电流 mA */
+uint8_t  motor_read_version(motor_version_t *ver, uint32_t timeout_ms); /* 0x1F */
+
+/* ---- 到位等待 & 换算 ---- */
+uint8_t  motor_wait_arrived(uint32_t timeout_ms);   /* 1=已到位(轮询 Prf_TF) */
+int32_t  motor_pulse_to_mm_x100(int32_t pulse);     /* 脉冲 -> 皮带行程 x100 mm */
+
+/* ---- 诊断计数 ---- */
+extern volatile uint16_t g_motor_done_cnt;      /* 收到 9F 到位/回零完成次数 */
+extern volatile uint32_t g_motor_err_cnt;       /* 收到 E2/EE 次数 */
+extern volatile uint8_t  g_motor_last_reply;    /* 最近一次返回码 */
+
 
 #endif /* __MOTOR_H__ */

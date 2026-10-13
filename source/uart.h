@@ -62,5 +62,6 @@ void     uart_send_data(uart_idx_t idx, const uint8_t *data, uint16_t len);
 int16_t  uart_recv_byte(uart_idx_t idx);                        /* 空缓冲返回 -1  */
 uint16_t uart_recv(uart_idx_t idx, uint8_t *dst, uint16_t len); /* 取最多 len 字节 */
 void     uart_driver_init(void);
+uint16_t uart_rx_count(uart_idx_t idx); 
 
 #endif 
