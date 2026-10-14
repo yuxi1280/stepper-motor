@@ -524,7 +524,7 @@ uint8_t motor_wait_arrived(uint32_t timeout_ms)
     }
 }
 
-/* 主循环调用: 消费电机主动返回(02 确认 / 9F 到位完成 / E2/EE 错误) */
+
 volatile uint16_t g_motor_done_cnt   = 0U;
 volatile uint32_t g_motor_err_cnt    = 0U;
 volatile uint8_t  g_motor_last_reply = 0U;

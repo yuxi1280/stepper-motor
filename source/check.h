@@ -47,11 +47,4 @@ void     check_clear_overcurrent(void); /* 手动清除过流标志 */
 void check_overcurrent_action(void);
 
 
-/* ---- CAN 上报 ---- */
-/* 每检测 N 次通过 CAN 上报一次; =1 表示每次检测都发 */
-#define CHECK_CAN_REPORT_DIV  (1U)
-
-void check_report(void);   /* 主动上报一次当前电流(mA) + ADC原始值 */
-
-
 #endif /* __CHECK_H__ */

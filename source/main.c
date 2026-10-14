@@ -206,7 +206,6 @@ int main(void)
     //motor_limit_home();
 
     servo_init();
-    
     //servo_set_mid_here(SERVO_ID_BROADCAST); 
     //DDL_DelayMS(100);
 
@@ -216,12 +215,14 @@ int main(void)
     for (;;) {
         motor_limit_task();     
         motor_rx_task(); 
-        //servo_run();
-        // servo_move(SERVO_ID_DEFAULT, 1500, 500);    /* 另一端 */
-        // DDL_DelayMS(1000);   
+        servo_rx_task();  
+        
+
+        //servo_run();  
         //check_task();   
         can_poll();       
-        
+          
+
                  
 
 

@@ -1,5 +1,6 @@
 #include "can.h"
 #include "motor.h"
+#include "servo.h"
 #include <string.h>
 
 /* ================= 内部帧结构 ================= */
@@ -194,6 +195,7 @@ static void can_handle_motor_cmd(const can_frame_t *f)
             break;
     }
 }
+
 
 /* ================= 主循环处理 ================= */
 void can_poll(void)

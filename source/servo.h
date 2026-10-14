@@ -4,72 +4,71 @@
 #include "main.h"
 
 /* ============================================================================
- * 众灵科技 ZP 系列总线舵机(单总线 UART) 驱动
+ * 众灵科技 ZP 系列总线舵机(单总线 UART) 收发驱动 —— 单舵机精简版
  * ----------------------------------------------------------------------------
  * 硬件:  USART3
  *          PB14 = USART3_TX  -> 接舵机信号线
- *          PB13 = USART3_RX  -> 预留回读(短接 TX), 当前不接收
+ *          PB13 = USART3_RX  -> 回读(短接 TX)
  * 协议:  '#' + ID(3位补零) + 'P' + 命令 + '!'
  *         位置控制: #000P1500T1000!   PWM:500~2500  TIME:0~9999(ms)
+ *         回读:     #OK!           通用成功
+ *                   #000P1500!      位置回读
  * 参数:  115200 / 8 数据位 / 1 停止位 / 无校验
- * 说明:  当前只发送指令, 不解析返回; 供电直接上电(无开关)
+ * 说明:  仅单个舵机, ID 固定, 波特率固定 115200
  * ========================================================================== */
 
-#define SERVO_BAUDRATE          (115200U)       /* 舵机总线波特率 */
+#define SERVO_BAUDRATE          (115200U)    /* 舵机总线波特率(固定) */
+#define SERVO_ID                (0U)         /* 舵机 ID(固定, 出厂默认 0) */
 
-#define SERVO_ID_DEFAULT        (0U)            /* 出厂默认 ID */
-#define SERVO_ID_BROADCAST      (255U)          /* 广播地址 */
+#define SERVO_PWM_MIN           (500U)       /* PWM 下限 */
+#define SERVO_PWM_MAX           (2500U)      /* PWM 上限 */
+#define SERVO_PWM_MID           (1500U)      /* PWM 中值 */
+#define SERVO_TIME_MAX          (9999U)      /* 运动时间上限 ms */
 
-#define SERVO_PWM_MIN           (500U)
-#define SERVO_PWM_MID           (1500U)
-#define SERVO_PWM_MAX           (2500U)
-#define SERVO_TIME_MAX          (9999U)
+/* 缓冲/帧长(缓冲大小必须是 2 的幂) */
+#define SERVO_TX_BUF_SIZE       (64U)
+#define SERVO_RX_BUF_SIZE       (128U)
+#define SERVO_LINE_MAX          (32U)
 
-/* 工作模式(PMODn) */
-#define SERVO_MODE_270_CW       (1U)    /* 舵机 270° 顺时针 */
-#define SERVO_MODE_270_CCW      (2U)    /* 舵机 270° 逆时针 */
-#define SERVO_MODE_180_CW       (3U)    /* 舵机 180° 顺时针 */
-#define SERVO_MODE_180_CCW      (4U)    /* 舵机 180° 逆时针 */
-#define SERVO_MODE_360_TURN_CW  (5U)    /* 马达 360° 定圈 顺时针 */
-#define SERVO_MODE_360_TURN_CCW (6U)    /* 马达 360° 定圈 逆时针 */
-#define SERVO_MODE_360_TIME_CW  (7U)    /* 马达 360° 定时 顺时针 */
-#define SERVO_MODE_360_TIME_CCW (8U)    /* 马达 360° 定时 逆时针 */
+/* 回读结果类型 */
+enum {
+    SERVO_REPLY_NONE = 0,
+    SERVO_REPLY_OK,          /* #OK!         通用成功 */
+    SERVO_REPLY_POS          /* #000P1500!   位置回读 */
+};
 
-/* 多舵机同步控制参数 */
+/* 最近一次回读解析结果 */
 typedef struct {
-    uint8_t  id;        /* 舵机 ID (0~254) */
-    uint16_t pwm;       /* 位置 500~2500 */
-    uint16_t time_ms;   /* 运动时间 0~9999 ms */
-} servo_cmd_t;
+    uint8_t  last_reply;     /* 见 SERVO_REPLY_* */
+    uint16_t position;       /* 位置 500~2500 */
+} servo_status_t;
 
-/* ---------------- 底层 ---------------- */
-void servo_init(void);                                  /* USART3 初始化(只发) */
-void servo_send(const uint8_t *data, uint16_t len);     /* 阻塞发送原始数据 */
-void servo_send_str(const char *str);                   /* 阻塞发送字符串 */
+/* ---------------- 初始化 ---------------- */
+void servo_init(void);                             /* 初始化 USART3 + 中断 + 缓冲 */
 
 /* ---------------- 位置控制 ---------------- */
-void servo_move(uint8_t id, uint16_t pwm, uint16_t time_ms);         /* 指定ID, PWM */
-void servo_move_angle(uint8_t id, uint16_t angle, uint16_t time_ms); /* 角度0~270° */
-void servo_move_broadcast(uint16_t pwm, uint16_t time_ms);           /* 广播(255) */
-void servo_move_multi(const servo_cmd_t *cmds, uint8_t n);           /* 多舵机 {} */
+void servo_move(uint16_t pwm, uint16_t time_ms);   /* #000PYYYYTZZZZ! */
 
-/* ---------------- 配置/控制命令(只发) ---------------- */
-void servo_unlock_torque(uint8_t id);             /* PULK 释放扭力 */
-void servo_lock_torque(uint8_t id);               /* PULR 恢复扭力 */
-void servo_set_mode(uint8_t id, uint8_t mode);    /* PMODn 1~8 */
-void servo_set_id(uint8_t old_id, uint8_t new_id);/* PIDxxx 改 ID */
-void servo_stop(uint8_t id);                      /* PDST 停止当前位置 */
-void servo_pause(uint8_t id);                     /* PDPT 暂停 */
-void servo_resume(uint8_t id);                    /* PDCT 继续 */
-void servo_set_baud(uint8_t id, uint8_t code);    /* PBDn 1~8(5=115200) */
-void servo_calib_mid(uint8_t id);                 /* PSCK 当前位置设为1500 */
-void servo_factory_reset(uint8_t id);             /* PCLE 恢复出厂 */
+/* ---------------- 控制指令(均回 #OK!) ---------------- */
+void servo_release(void);        /* PULK 释放扭力 */
+void servo_restore(void);        /* PULR 恢复扭力 */
+void servo_pause(void);          /* PDPT 暂停 */
+void servo_resume(void);         /* PDCT 继续 */
+void servo_stop(void);           /* PDST 停止在当前位置 */
+void servo_set_mid_here(void);   /* PSCK 当前位置标定为 1500 中值 */
 
-/* ---------------- 上电流程 ---------------- */
-void servo_boot(void);   /* 等待上电稳定 -> 回中位 -> 恢复扭力 */
-void servo_calib_mid(uint8_t id);                 /* PSCK 当前位置设为1500 */
-void servo_set_mid_here(uint8_t id);              /* 释放扭力 -> 当前位置标定为中位 -> 恢复扭力 */
-void servo_run(void);   /*舵机动作流程*/
+/* ---------------- 读取位置(回 #000P1500!) ---------------- */
+void servo_read_pos(void);       /* PRAD */
+
+/* ---------------- 主循环任务 & 辅助 ---------------- */
+void    servo_rx_task(void);                                /* 消费接收缓冲, 解析应答帧 */
+void    servo_run(void);                                    /* 演示: 扫动一次(阻塞, 可选) */
+void    servo_flush_rx(void);                               /* 清空接收缓冲 */
+uint8_t servo_wait_reply(uint8_t reply, uint32_t timeout_ms);/* 等某类应答, 1=收到 */
+
+/* ---------------- 回读状态 ---------------- */
+extern volatile servo_status_t g_servo_st;      /* 最近一次解析结果 */
+extern volatile uint32_t       g_servo_ok_cnt;  /* 收到 #OK! 次数 */
 
 
 

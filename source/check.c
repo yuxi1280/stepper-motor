@@ -7,7 +7,7 @@ uint16_t g_check_current  = 0U;
 uint8_t  g_check_oc       = 0U;
 
 static uint8_t  s_tick = 0U;
-static uint8_t  s_rep_tick = 0U;
+
 
 #if (CHECK_ZERO_CALIB != 0U)
 static int16_t  s_zero_raw = 0;          /* 零电流时的 ADC 原始值 */
@@ -66,20 +66,7 @@ static uint16_t check_adc_to_ma(uint16_t raw)
     return (uint16_t)(((uint32_t)v * CHECK_ADC_VREF_MV) / CHECK_ADC_FULL_SCALE);
 }
 
-/* ================= 通过 CAN 上报电流 =================
- * 数据(4字节): [mA高, mA低, ADC高, ADC低]  均为大端
- */
-void check_report(void)
-{
-    uint8_t d[4];
 
-    d[0] = (uint8_t)(g_check_current >> 8);
-    d[1] = (uint8_t)(g_check_current);
-    d[2] = (uint8_t)(g_check_adc_raw >> 8);
-    d[3] = (uint8_t)(g_check_adc_raw);
-
-    can_tx_bytes(CAN_CURRENT_ID, d, 4U);
-}
 
 
 /* ------------------------- 初始化 ------------------------- */
@@ -139,33 +126,6 @@ void check_calib_zero(void)
 #endif
 }
 
-/* ------------------------- 周期任务 ------------------------- */
-// void check_task(void)
-// {
-//     uint16_t raw;
-//     uint16_t cur;
-
-//     if (++s_tick < CHECK_TICK_DIV) {
-//         return;
-//     }
-//     s_tick = 0U;
-
-//     raw = check_adc_read_avg();
-//     if (raw == 0xFFFFU) {
-//         return;                          /* 采样失败, 保留上次值 */
-//     }
-//     g_check_adc_raw = raw;
-//     cur = check_adc_to_ma(raw);
-//     g_check_current = cur;
-
-//     if (cur > CHECK_CURRENT_THRESH_MA) {
-//         if (g_check_oc == 0U) {           /* 上升沿: 只触发一次 */
-//             g_check_oc = 1U;
-//             check_overcurrent_action();
-//         }
-//     }
-//     /* 标志不自动清: 需要恢复时调 check_clear_overcurrent() */
-// }
 
 void check_task(void)
 {
@@ -179,17 +139,11 @@ void check_task(void)
 
     raw = check_adc_read_avg();
     if (raw == 0xFFFFU) {
-        return;                          /* 采样失败, 保留上次值, 也不上报 */
+        return;                          /* 采样失败, 保留上次值 */
     }
     g_check_adc_raw = raw;
     cur = check_adc_to_ma(raw);
     g_check_current = cur;
-
-    /* === 每检测完一次, 上报当前值 === */
-    if (++s_rep_tick >= CHECK_CAN_REPORT_DIV) {
-        s_rep_tick = 0U;
-        check_report();
-    }
 
     if (cur > CHECK_CURRENT_THRESH_MA) {
         if (g_check_oc == 0U) {
@@ -198,6 +152,7 @@ void check_task(void)
         }
     }
 }
+
 
 
 /* ------------------------- 查询 / 清除 ------------------------- */
