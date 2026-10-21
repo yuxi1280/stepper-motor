@@ -156,11 +156,7 @@ static void lc_store_point(int32_t raw)
     lc_report_point((uint8_t)(idx + 1U));
 }
 
-/* ================= 运动辅助 =================
- * 不用 motor_move_abs(): FD mode=1 的坐标零点是驱动内部绝对坐标,
- * 0x0A(当前位置清零)不会复位它, 走到某个点后驱动会认为"已到位"不再动.
- * 统一用 mode=2(相对当前实时位置)走剩余脉冲.
- */
+/* ================= 运动辅助 =================*/
 static void lc_move_forward(int32_t pulse)
 {
     if (pulse <= 0) {
@@ -203,7 +199,7 @@ static lc_result_t lc_scan_body(uint8_t do_home)
         }
     }
 
-    /* 2. 使能 + 记录起点脉冲(后面所有点相对它) */
+    /* 2. 使能 + 记录起点脉冲 */
     motor_enable(1U);
     DDL_DelayMS(100U);
     motor_flush_rx();

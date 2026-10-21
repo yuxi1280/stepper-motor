@@ -23,7 +23,7 @@
 /* ---- 标尺/运动 ---- */
 #define LC_POINT_MAX            (10U)
 #define LC_TARGET_MM            (1500U)
-#define LC_SCAN_RPM             (100U)    /* 扫描速度, 凸点窄就再降 */
+#define LC_SCAN_RPM             (80U)    /* 扫描速度, 凸点窄就再降 */
 #define LC_SCAN_ACC             (100U)
 
 /* 16齿 S3M 同步轮: 16 × 3mm = 48mm/圈 */
@@ -35,7 +35,7 @@
 /* ---- 时序 ---- */
 #define LC_POLL_MS              (1U)
 #define LC_POS_TIMEOUT_MS       (50U)     /* 停车后读数: 驱动应答偶尔 >5ms */
-#define LC_POS_TIMEOUT_FAST_MS  (5U)      /* 运行中兜底读数, 尽量少挡传感器 */
+#define LC_POS_TIMEOUT_FAST_MS  (5U)      /* 运行中兜底读数 */
 #define LC_READ_RETRY           (3U)
 #define LC_BACKUP_CHECK_MS      (500U)
 #define LC_STOP_SETTLE_MS       (80U)
