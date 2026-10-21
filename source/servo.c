@@ -311,12 +311,29 @@ uint8_t servo_wait_reply(uint8_t reply, uint32_t timeout_ms)
 
 void servo_run(void)
 {
-    servo_move(SERVO_PWM_MID, 500U);
-    DDL_DelayMS(800U);
-    servo_move(2200U, 500U);
-    DDL_DelayMS(800U);
-    servo_move(SERVO_PWM_MID, 500U);
-    DDL_DelayMS(800U);
+    servo_move(2200U, 200U);
+    DDL_DelayMS(300U);
+    servo_move(SERVO_PWM_MID, 200U);
+    DDL_DelayMS(300U);
 }
 
 
+
+/* ==================== 回中 ====================
+ * 流程: 暂停当前动作 -> 释放扭力 -> 回到 1500 中位 -> 恢复扭力
+ * 说明: 内部有阻塞延时(约 SERVO_CENTER_TIME_MS + 2*SERVO_CMD_GAP_MS),
+ *       只在故障处理时调用, 不要放进高频任务。
+ */
+void servo_center(void)
+{
+    servo_pause();                                   /* PDPT: 暂停当前动作 */
+    DDL_DelayMS(SERVO_CMD_GAP_MS);
+
+    servo_release();                                 /* PULK: 释放扭力 */
+    DDL_DelayMS(SERVO_CMD_GAP_MS);
+
+    servo_move(SERVO_PWM_MID, SERVO_CENTER_TIME_MS); /* P1500T0500: 回中位 */
+    DDL_DelayMS(SERVO_CENTER_TIME_MS + SERVO_CMD_GAP_MS);   /* 等它到位 */
+
+    servo_restore();                                 /* PULR: 恢复扭力 */
+}

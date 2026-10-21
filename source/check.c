@@ -1,5 +1,6 @@
 #include "check.h"
 #include "can.h"
+#include "servo.h"
 
 /* ------------------------- 全局状态 ------------------------- */
 uint16_t g_check_adc_raw  = 0U;
@@ -161,11 +162,14 @@ uint16_t check_adc_raw(void)             { return g_check_adc_raw; }
 uint8_t  check_is_overcurrent(void)      { return g_check_oc; }
 void     check_clear_overcurrent(void)   { g_check_oc = 0U; }
 
-/* ------------------------- 过流动作(默认空, 可在 main.c 重写) ------------------------- */
+/* ------------------------- 过流动作 ------------------------- */
 __WEAKDEF void check_overcurrent_action(void)
 {
     /* 默认什么都不做; 在 main.c 里重写它即可, 例如:
      *   servo_stop(SERVO_ID_DEFAULT);
      *   motor_stop();
      */
+    servo_pause();
+    servo_center(); 
+    /*can上报*/
 }

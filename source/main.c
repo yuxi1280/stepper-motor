@@ -27,6 +27,8 @@
 #include "servo.h"
 #include "can.h"
 #include "check.h"
+#include "lc.h"
+
 
 /*******************************************************************************
  * Local type definitions ('typedef')
@@ -118,12 +120,12 @@ static void App_PortCfg(void)
     stcGpioInit.u16PinAttr = PIN_ATTR_ANALOG;
     (void)GPIO_Init(GPIO_PORT_B, GPIO_PIN_01, &stcGpioInit);
 
-    /* PB12 set to GPIO-Input */
+    /* PB12计数 set to GPIO-Input */
     (void)GPIO_StructInit(&stcGpioInit);
     stcGpioInit.u16PinAttr = PIN_ATTR_DIGITAL;
     (void)GPIO_Init(GPIO_PORT_B, GPIO_PIN_12, &stcGpioInit);
 
-    /* PB4 set to GPIO-Input */
+    /* PB4限位 set to GPIO-Input */
     GPIO_SetDebugPort(GPIO_PIN_TRST, DISABLE);
     (void)GPIO_StructInit(&stcGpioInit);
     stcGpioInit.u16PinAttr = PIN_ATTR_DIGITAL;
@@ -200,14 +202,17 @@ int main(void)
     uart_driver_init();
     check_init();         
 
-    motor_init();
+    servo_init();
+    DDL_DelayMS(100U);  
+    servo_move(SERVO_PWM_MID, SERVO_CENTER_TIME_MS);
+    DDL_DelayMS(SERVO_CENTER_TIME_MS + 100U);   
+    motor_init();  
+    lc_init();  
+
     motor_enable(1);
     DDL_DelayMS(200);
-    //motor_limit_home();
+ 
 
-    servo_init();
-    //servo_set_mid_here(SERVO_ID_BROADCAST); 
-    //DDL_DelayMS(100);
 
 
     /* Register write protected for some required peripherals. */

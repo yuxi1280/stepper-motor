@@ -1,0 +1,153 @@
+ninja_required_version = 1.8
+
+program_name=router
+
+lib_dir = "D:/programs/arm-gnu-toolchain-12.2/lib/gcc/arm-none-eabi/12.2.0/thumb/v7e-m+fp/hard"
+lwip_dir = ../lwip-2.2.1
+
+cflags = -std=c99 -mthumb -mcpu=cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16 -Os -Wall -Werror $
+  -ID:/programs/arm-gnu-toolchain-12.2/arm-none-eabi/include $
+  -I../HC32F4A0_DDL_Rev2.4.0/drivers/hc32_ll_driver/inc $
+  -I../HC32F4A0_DDL_Rev2.4.0/drivers/cmsis/Device/HDSC/hc32f4xx/Include $
+  -I../HC32F4A0_DDL_Rev2.4.0/drivers/cmsis/Include $
+  -I../HC32F4A0_DDL_Rev2.4.0/midwares/hc32/usb $
+  -I../HC32F4A0_DDL_Rev2.4.0/midwares/hc32/usb/usb_device_lib/device_core $
+  -I$lwip_dir $
+  -I$lwip_dir/src/include $
+  -I$lwip_dir/contrib/ports/hdsc/port/include $
+  -I. $
+  -DHC32F4A0 $
+  -DUSE_DDL_DRIVER $
+  -D__TARGET_FPU_VFP -D__FPU_PRESENT
+
+rule hc32_gcc
+  command = D:/programs/arm-gnu-toolchain-12.2/bin/arm-none-eabi-gcc.exe -c $cflags $in -o $out
+  depfile = $out.d
+  deps = gcc
+
+
+# HC32驱动库
+# 注意：第一个运行的程序必须编译hc32_ll_icg.c！
+driver_src_dir = ../HC32F4A0_DDL_Rev2.4.0/drivers/hc32_ll_driver/src
+usb_device_lib_dir = ../HC32F4A0_DDL_Rev2.4.0/midwares/hc32/usb/usb_device_lib
+
+obj_dir = ./objs
+
+build $obj_dir/hc32_ll.o: hc32_gcc $driver_src_dir/hc32_ll.c
+build $obj_dir/hc32_ll_icg.o: hc32_gcc $driver_src_dir/hc32_ll_icg.c
+build $obj_dir/hc32_ll_clk.o: hc32_gcc $driver_src_dir/hc32_ll_clk.c
+build $obj_dir/hc32_ll_pwc.o: hc32_gcc $driver_src_dir/hc32_ll_pwc.c
+build $obj_dir/hc32_ll_fcg.o: hc32_gcc $driver_src_dir/hc32_ll_fcg.c
+build $obj_dir/hc32_ll_efm.o: hc32_gcc $driver_src_dir/hc32_ll_efm.c
+build $obj_dir/hc32_ll_sram.o: hc32_gcc $driver_src_dir/hc32_ll_sram.c
+build $obj_dir/hc32_ll_interrupts.o: hc32_gcc $driver_src_dir/hc32_ll_interrupts.c
+build $obj_dir/hc32_ll_utility.o: hc32_gcc $driver_src_dir/hc32_ll_utility.c
+build $obj_dir/hc32_ll_gpio.o: hc32_gcc $driver_src_dir/hc32_ll_gpio.c
+build $obj_dir/hc32_ll_usart.o: hc32_gcc $driver_src_dir/hc32_ll_usart.c
+build $obj_dir/hc32_ll_usb.o: hc32_gcc $driver_src_dir/hc32_ll_usb.c
+build $obj_dir/hc32_ll_fcm.o: hc32_gcc $driver_src_dir/hc32_ll_fcm.c
+build $obj_dir/hc32_ll_rtc.o: hc32_gcc $driver_src_dir/hc32_ll_rtc.c
+build $obj_dir/hc32_ll_eth.o: hc32_gcc $driver_src_dir/hc32_ll_eth.c
+build $obj_dir/hc32_ll_trng.o: hc32_gcc $driver_src_dir/hc32_ll_trng.c
+build $obj_dir/hc32_ll_wdt.o: hc32_gcc $driver_src_dir/hc32_ll_wdt.c
+build $obj_dir/hc32_ll_rmu.o: hc32_gcc $driver_src_dir/hc32_ll_rmu.c
+
+
+# USB
+build $obj_dir/usb_dev_core.o: hc32_gcc $usb_device_lib_dir/device_core/usb_dev_core.c
+build $obj_dir/usb_dev_ctrleptrans.o: hc32_gcc $usb_device_lib_dir/device_core/usb_dev_ctrleptrans.c
+build $obj_dir/usb_dev_driver.o: hc32_gcc $usb_device_lib_dir/device_core/usb_dev_driver.c
+build $obj_dir/usb_dev_int.o: hc32_gcc $usb_device_lib_dir/device_core/usb_dev_int.c
+build $obj_dir/usb_dev_stdreq.o: hc32_gcc $usb_device_lib_dir/device_core/usb_dev_stdreq.c
+
+build $obj_dir/usb_dev_cdc_class.o: hc32_gcc usb_dev_cdc_class.c
+build $obj_dir/usb_bsp.o: hc32_gcc usb_bsp.c
+build $obj_dir/usb_dev_desc.o: hc32_gcc usb_dev_desc.c
+build $obj_dir/usb_dev_user.o: hc32_gcc usb_dev_user.c
+
+# 应用
+build $obj_dir/startup_hc32f4a0.o: hc32_gcc startup_hc32f4a0.S
+build $obj_dir/system_hc32f4a0.o: hc32_gcc system_hc32f4a0.c
+build $obj_dir/newlib_sys_calls.o: hc32_gcc newlib_sys_calls.c
+build $obj_dir/app.o: hc32_gcc app.c
+build $obj_dir/board.o: hc32_gcc board.c
+build $obj_dir/can.o: hc32_gcc can.c
+build $obj_dir/can_context.o: hc32_gcc can_context.c
+build $obj_dir/ring_buffer.o: hc32_gcc ring_buffer.c
+build $obj_dir/rtc.o: hc32_gcc rtc.c
+build $obj_dir/board_rtl8201.o: hc32_gcc board_rtl8201.c
+build $obj_dir/rtl8201.o: hc32_gcc rtl8201.c
+build $obj_dir/ethernetif.o: hc32_gcc ethernetif.c
+
+build $obj_dir/shelf.o: hc32_gcc shelf.c
+build $obj_dir/shelf_usb.o: hc32_gcc shelf_usb.c
+
+rule hc32_ld
+  command = arm-none-eabi-ld -T HC32F4A0xI.ld -L$lib_dir  $in -lc_nano -lgcc -o $out
+
+
+build $obj_dir/$program_name.out: hc32_ld $
+  $obj_dir/hc32_ll.o $
+  $obj_dir/hc32_ll_icg.o $
+  $obj_dir/hc32_ll_clk.o $
+  $obj_dir/hc32_ll_pwc.o $
+  $obj_dir/hc32_ll_fcg.o $
+  $obj_dir/hc32_ll_efm.o $
+  $obj_dir/hc32_ll_sram.o $
+  $obj_dir/hc32_ll_interrupts.o $
+  $obj_dir/hc32_ll_utility.o $
+  $obj_dir/hc32_ll_gpio.o $
+  $obj_dir/hc32_ll_usart.o $
+  $obj_dir/hc32_ll_usb.o $
+  $obj_dir/hc32_ll_fcm.o $
+  $obj_dir/hc32_ll_rtc.o $
+  $obj_dir/hc32_ll_eth.o $
+  $obj_dir/hc32_ll_trng.o $
+  $obj_dir/hc32_ll_wdt.o $
+  $obj_dir/hc32_ll_rmu.o $
+  $obj_dir/usb_dev_core.o $
+  $obj_dir/usb_dev_ctrleptrans.o $
+  $obj_dir/usb_dev_driver.o $
+  $obj_dir/usb_dev_int.o $
+  $obj_dir/usb_dev_stdreq.o $
+  $obj_dir/startup_hc32f4a0.o $
+  $obj_dir/system_hc32f4a0.o $
+  $obj_dir/newlib_sys_calls.o $
+  $obj_dir/app.o $
+  $obj_dir/board.o $
+  $obj_dir/can.o $
+  $obj_dir/can_context.o $
+  $obj_dir/ring_buffer.o $
+  $obj_dir/usb_bsp.o $
+  $obj_dir/usb_dev_desc.o $
+  $obj_dir/usb_dev_user.o $
+  $obj_dir/usb_dev_cdc_class.o $
+  $obj_dir/rtc.o $
+  $obj_dir/board_rtl8201.o $
+  $obj_dir/rtl8201.o $
+  $obj_dir/ethernetif.o $
+  $obj_dir/shelf.o $
+  $obj_dir/shelf_usb.o $
+  $lwip_dir/lwip.a
+
+rule hc32_objcopy
+  command = arm-none-eabi-objcopy -O ihex $in $out
+rule hc32_objcopy_binary
+  command = arm-none-eabi-objcopy -O binary $in $out
+
+
+build $program_name.hex: hc32_objcopy $obj_dir/$program_name.out
+
+# https://pyocd.io/docs/builtin-targets.html
+rule hc32_erase
+  command = pyocd erase -t hc32f4a0xi --chip
+rule hc32_program
+  command = pyocd load -t hc32f4a0xi $in
+
+build erase: hc32_erase
+build program: hc32_program $program_name.hex || erase
+
+build $program_name.bin: hc32_objcopy_binary $obj_dir/$program_name.out
+build bin: phony $program_name.bin
+
+default $program_name.hex

@@ -70,6 +70,11 @@ uint8_t servo_wait_reply(uint8_t reply, uint32_t timeout_ms);/* 等某类应答,
 extern volatile servo_status_t g_servo_st;      /* 最近一次解析结果 */
 extern volatile uint32_t       g_servo_ok_cnt;  /* 收到 #OK! 次数 */
 
+/* ---------------- 回中(过流保护用) ---------------- */
+#define SERVO_CENTER_TIME_MS    (200U)   /* 回中运动时间 ms */
+#define SERVO_CMD_GAP_MS        (50U)    /* 指令间隔, 等舵机收帧/应答 */
+
+void servo_center(void);   /* 暂停 -> 释放扭力 -> 回1500中位 -> 恢复扭力 */
 
 
 

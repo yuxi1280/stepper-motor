@@ -1,0 +1,6 @@
+#ifndef NEWLIB_SYSCALLS_H
+#define NEWLIB_SYSCALLS_H
+
+
+
+#endif	// NEWLIB_SYSCALLS_H

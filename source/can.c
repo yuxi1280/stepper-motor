@@ -1,5 +1,6 @@
 #include "can.h"
 #include "motor.h"
+#include "lc.h"
 #include "servo.h"
 #include <string.h>
 
@@ -173,6 +174,11 @@ static void can_handle_interior_query(const can_frame_t *f)
     can_tx_bytes(CAN_NODE_ID, ack, sizeof(ack));
 }
 
+void can_rx_flush(void)
+{
+    s_rxQueue.tail = s_rxQueue.head;
+}
+
 /* 电机控制命令: 0x01 归零 / 0x02 去第 n 个工位 */
 static void can_handle_motor_cmd(const can_frame_t *f)
 {
@@ -182,8 +188,9 @@ static void can_handle_motor_cmd(const can_frame_t *f)
 
     switch (f->au8Data[0]) {
         case CAN_CMD_HOME:                       /* 归零 */
-            motor_limit_home();
+            motor_limit_home() ;
             break;
+
 
         case CAN_CMD_GOTO:                       /* 去第 n 个工位 */
             if (f->u8Dlc >= 2U) {
@@ -191,10 +198,27 @@ static void can_handle_motor_cmd(const can_frame_t *f)
             }
             break;
 
+        case CAN_CMD_LC_SCAN:                    /* 标尺扫描 */
+            if (f->u8Dlc >= 2U) {
+                (void)lc_scan_run(f->au8Data[1]);
+            } else {
+                (void)lc_scan_run(1U);
+            }
+            can_rx_flush();                      /* 丢掉扫描期间堆积的重复命令 */
+            break;
+
+        case CAN_CMD_LC_RESULT:                  /* 重发上次结果 */
+            lc_report_can();
+            break;
+
+
+
+
         default:
             break;
     }
 }
+
 
 
 /* ================= 主循环处理 ================= */

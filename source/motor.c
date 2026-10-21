@@ -2,6 +2,7 @@
 #include "uart.h"
 #include "motor.h"
 #include "servo.h"
+#include "lc.h"
 //#include "can.h"
 //#include "check.h"
 
@@ -189,7 +190,8 @@ static uint8_t motor_limit_active(void)
     return (GPIO_ReadInputPins(MOTOR_LIMIT_PORT, MOTOR_LIMIT_PIN) == PIN_RESET);
 }
 
-uint8_t motor_limit_home(void)
+/* 单次归零: 逼近限位 -> 清零, 返回 1=成功 0=超时 */
+static uint8_t motor_limit_home_once(void)
 {
     uint32_t tick = 0U;
 
@@ -225,6 +227,48 @@ uint8_t motor_limit_home(void)
     motor_zero_pos();
     return 1U;
 }
+
+/* 归零后状态校验: 读 0x3B 回零状态 + 0x3A 电机状态
+ * 返回 1=状态正常, 0=检测到掉电(OAC_TF 置位)
+ */
+static uint8_t motor_home_state_ok(void)
+{
+    uint8_t home_st;   /* 0x3B 回零状态 */
+    uint8_t motor_st;  /* 0x3A 电机状态 */
+
+    home_st  = motor_read_home_status(MOTOR_RX_TIMEOUT_MS);
+    motor_st = motor_read_status(MOTOR_RX_TIMEOUT_MS);
+
+    (void)home_st;     /* 回零状态本版仅读取, 可按需判 ORG_CF(回零失败)等 */
+
+    /* 掉电标志 OAC_TF 置位 -> 判定掉电 */
+    if ((motor_st != 0xFFU) && ((motor_st & MOTOR_ST_OAC_TF) != 0U)) {
+        return 0U;
+    }
+    return 1U;
+}
+
+/* 归零 + 掉电校验: 每次归零后读 0x3B/0x3A, 掉电则重新上电并重归零一次 */
+uint8_t motor_limit_home(void)
+{
+    uint8_t try;
+
+    for (try = 0U; try <= MOTOR_HOME_PWR_RETRY; try++) {
+        if (motor_limit_home_once() == 0U) {
+            return 0U;                       /* 归零超时失败 */
+        }
+        if (motor_home_state_ok() != 0U) {
+            return 1U;                       /* 状态正常(未掉电) */
+        }
+        /* 掉电: 重新上电(解除报警 + 重新使能), 然后重试归零 */
+        motor_clear_alarm();
+        DDL_DelayMS(20);
+        motor_enable(1);
+        DDL_DelayMS(100);
+    }
+    return 0U;                               /* 重试后仍掉电: 报失败 */
+}
+
 
 /* 限位任务: 主循环每轮调用, 触发边沿只停一次 */
 static uint8_t s_limit_last = 1U;    /* 上次电平: 1=未触发(高) 0=触发(低) */
@@ -277,6 +321,7 @@ void motor_goto_point(uint8_t n)
     pulse = motor_mm_to_pulse(mm);
     motor_move_abs(pulse, POS_RPM, POS_ACC);   /* 绝对位置(相对回零的0点) */
 }
+
 
 
 /* ================= 接收/读取 ================= */

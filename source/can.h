@@ -31,8 +31,20 @@ void can_tx_bytes_std(uint32_t std_id, const uint8_t *p, uint8_t n); /* 标准�
 /* 电流上报 ID(扩展帧) */
 #define CAN_CURRENT_ID       (0x0100U | SLAVE_ADDR)   /* 板子 -> 主机: 电流值 */
 
+
+
 /* 电机控制命令(主机 -> 板子) */
 #define CAN_CMD_HOME         (0x01U)   /* 归零:       data = {0x01} */
 #define CAN_CMD_GOTO         (0x02U)   /* 去工位:     data = {0x02, n} , n 从 1 开始 */
+#define CAN_CMD_LC_SCAN      (0x03U)   /* 标尺扫描: data = {0x03, home} */
+#define CAN_CMD_LC_RESULT    (0x04U)   /* 重发结果: data = {0x04} */
+
+#define CAN_LC_RPT_SUM       (0xA3U)   /* A3 00 result count targetH targetL */
+#define CAN_LC_RPT_POINT     (0xA4U)   /* A4 idx pos_mm_x100(4B) gap_mm_x100(2B) */
+#define CAN_LC_RPT_PULSE     (0xA5U)   /* A5 idx rel_pulse(4B) */
+#define CAN_LC_RPT_INFO      (0xA6U)   /* A6 base_pulse(4B) ppr(2B) mm_per_rev(1B) */
+
+void can_rx_flush(void);               /* 丢弃接收队列里的残留命令 */
+
 
 #endif /* __CAN_H__ */

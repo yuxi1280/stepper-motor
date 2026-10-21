@@ -4,7 +4,7 @@
 #include "main.h"
 
 /* ============================================================================
- * Emm 闭环步进/伺服电机 总线驱动 (基于 source/uart.c)
+ * 张大头42步进Emm固件 闭环步进/伺服电机 总线驱动 
  * ----------------------------------------------------------------------------
  * 总线:  USART1 (PA04=TX, PA03=RX), 由 uart_driver_init() 初始化
  * 帧:    addr + code + data... + check
@@ -13,16 +13,17 @@
  * ========================================================================== */
 
  /* ===== 工位定义(归零后) =====
- * 第 1 个点距零点 10mm, 之后每点比前一个远 15mm:
- *   n=1 -> 10mm, n=2 -> 27mm, n=3 -> 44mm, ...
+ * 第1个点距零点 POS_FIRST_MM mm, 之后每点比前一个远 POS_STEP_MM mm:
+ 共100个工位
  */
-#define POS_FIRST_MM         (10U)   /* 第一个工位距零点 mm */
+#define POS_COUNT            (100U)   /* 钢网工位数 */
+#define POS_FIRST_MM         (139U)   /* 第一个工位距零点 mm */
 #define POS_STEP_MM          (15U)   /* 工位间距 mm */
 
 
-#define MOTOR_ADDR_DEFAULT      (1U)    /* 出厂默认地址 */
+#define MOTOR_ADDR_DEFAULT      (1U)    /* 地址 */
 #define MOTOR_ADDR_BROADCAST    (0U)    /* 广播地址 */
-#define MOTOR_CHECK_BYTE        (0x6B)  /* 出厂默认校验 */
+#define MOTOR_CHECK_BYTE        (0x6B)  /* 校验 */
 
 #define MOTOR_PULSES_PER_REV    (3200U) /* Emm: 3200 脉冲/圈 */
 #define MOTOR_MAX_RPM           (3000U)
@@ -37,10 +38,10 @@
 #define MOTOR_HOME_DIR          (1U)    /* 单圈方向回零 */
 #define MOTOR_HOME_COLLIDE      (2U)    /* 无限位碰撞回零 */
 
-/* ---- 初始化(配置限位输入 GPIO, 用限位回零时调用) ---- */
+/* ---- 初始化 ---- */
 void motor_init(void);
 
-/* ---- 底层(可发任意命令/广播) ---- */
+/* ---- 底层 ---- */
 void motor_tx(uint8_t addr, uint8_t code, const uint8_t *data, uint8_t len);
 
 /* ---- 地址/校验配置 ---- */
@@ -76,19 +77,19 @@ void motor_req_position(void);            /* 36 */
 int32_t motor_deg_to_pulse(int32_t deg_x100);  /* deg_x100: 角度*100, 返回脉冲 */
 
 /* ---- 限位开关回零 ----
- * 新板限位输入: PB4 (低电平=触发)
- * 注意: PB4 默认是 TRST(JTAG), 用作普通 IO 需先关闭调试口
+ * 限位输入: PB4 (低电平=触发)
  */
 #define MOTOR_LIMIT_PORT        (GPIO_PORT_B)   /* 限位输入端口 */
 #define MOTOR_LIMIT_PIN         (GPIO_PIN_04)   /* 限位输入引脚, 低电平=触发 */
-#define MOTOR_LIMIT_SPEED       (200U)          /* 逼近速度 RPM(慢速防撞) */
-#define MOTOR_LIMIT_ACC         (200U)          /* 加速度档 */
-#define MOTOR_LIMIT_TIMEOUT_MS  (10000U)        /* 超时 10s 防限位失效 */
+#define MOTOR_LIMIT_SPEED       (80U)          /* 逼近速度 RPM(慢速防撞) */
+#define MOTOR_LIMIT_ACC         (100U)          /* 加速度档 */
+#define MOTOR_LIMIT_TIMEOUT_MS  (30000U)        /* 超时 30s 防限位失效 */
 
 uint8_t motor_limit_home(void);          /* 返回1=回零成功 0=超时失败 */
 void motor_limit_task(void);             /* 主循环每轮调用: 限位沿检测 */
+#define MOTOR_HOME_PWR_RETRY    (1U)     /* 掉电后重上电/重归零的最多重试次数 */
 
-/* ===== 机械参数(示例: 16齿 S3M 同步轮, 按实际修改) =====
+/* ===== 机械参数(示例: 16齿 S3M 同步轮) =====
  * S3M 节距 3.000mm -> 每圈皮带行程 = 16 * 3 = 48mm
  * 电机 3200 脉冲/圈 -> 10 圈 = 32000 脉冲 = 480mm = 48cm
  */
@@ -108,7 +109,7 @@ int32_t motor_mm_to_pulse(uint32_t mm);   /* 皮带行程 mm -> 电机脉冲 */
 #define HOME_SETTLE_MS          (500U)    /* 回零后机械稳定 */
 
 void motor_goto_point(uint8_t n);   /* 去第 n 个工位(n 从 1 开始), 内部换算脉冲 */
-/* ================= 回读(自由协议: 地址 + 功能码 + 数据 + 校验) ================= */
+/* ================= 回读(协议: 地址 + 功能码 + 数据 + 校验) ================= */
 #define MOTOR_RX_TIMEOUT_MS   (50U)   /* 单次读取默认超时(ms) */
 #define MOTOR_RX_FRAME_MAX    (8U)    /* 手册里最长返回帧 8 字节 */
 #define MOTOR_ERR_TIMEOUT     (INT32_MIN)  /* 读取失败的返回值 */
