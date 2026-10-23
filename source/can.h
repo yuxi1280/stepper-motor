@@ -43,6 +43,8 @@ void can_tx_bytes_std(uint32_t std_id, const uint8_t *p, uint8_t n); /* 标准�
 #define CAN_LC_RPT_POINT     (0xA4U)   /* A4 idx pos_mm_x100(4B) gap_mm_x100(2B) */
 #define CAN_LC_RPT_PULSE     (0xA5U)   /* A5 idx rel_pulse(4B) */
 #define CAN_LC_RPT_INFO      (0xA6U)   /* A6 base_pulse(4B) ppr(2B) mm_per_rev(1B) */
+#define CAN_LC_RPT_SAMPLE    (0xACU)   /* AC pass slot n pulse(4B) */
+
 
 void can_rx_flush(void);               /* 丢弃接收队列里的残留命令 */
 
