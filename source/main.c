@@ -194,6 +194,8 @@ int main(void)
     //App_ADCCfg();
     //USARTx Config
     App_USARTxCfg();
+    //SysTick: CAN 协议的心跳/超时/节拍时基(1ms)
+    (void)SysTick_Init(1000UL);
     //CAN Config
     //App_CANCfg();
     can_init(); 
@@ -221,12 +223,8 @@ int main(void)
         motor_limit_task();     
         motor_rx_task(); 
         servo_rx_task();  
-        
-
-        //servo_run();  
-        //check_task();   
-        can_poll();       
-          
+        check_task();          /* 总轨电流采样/过流判定 */
+        can_task();            /* CAN 收包 + 任务队列 + 自检调度 */
 
                  
 
@@ -238,6 +236,12 @@ int main(void)
         
 
     }
+}
+
+/* SysTick 1ms 时基: CAN 协议的心跳/运动超时都用 SysTick_GetTick() */
+void SysTick_Handler(void)
+{
+    SysTick_IncTick();
 }
 
 /* INT_SRC_CAN_INT Callback. */

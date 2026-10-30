@@ -73,11 +73,17 @@ void USART3_RxError_IrqHandler(void)
     (void)USART_ReadData(CM_USART3);
 }
 
-/* 启动发送: 若缓冲非空, 写首字节并开 TXE 中断 */
+/* 启动发送: 只在发送寄存器空(TXE=1)时写一个字节, 其余交给 TXE 中断逐个推进。
+ * 注意: 发送器忙时硬写 TDR 会丢字节, 命令帧会变成残帧被舵机忽略。
+ */
 static void servo_start_tx(void)
 {
     if (s_tx_head == s_tx_tail) {
         return;
+    }
+    if (USART_GetStatus(CM_USART3, USART_FLAG_TX_EMPTY) == RESET) {
+        USART_FuncCmd(CM_USART3, USART_INT_TX_EMPTY, ENABLE);
+        return;                          /* 忙: 等中断来取 */
     }
     USART_WriteData(CM_USART3, (uint8_t)s_tx[s_tx_head]);
     s_tx_head = SERVO_TX_NEXT(s_tx_head);

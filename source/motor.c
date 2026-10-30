@@ -204,6 +204,8 @@ static uint8_t motor_limit_home_once(void)
         DDL_DelayMS(20);
         motor_clear_alarm();
         DDL_DelayMS(20);
+        motor_enable(1);              /* 解除报警后必须重新使能 */
+        DDL_DelayMS(50);
         motor_zero_pos();             /* 当前位置赋为0点 */
         return 1U;
     }
@@ -219,11 +221,14 @@ static uint8_t motor_limit_home_once(void)
         }
     }
 
-    /* 撞到限位: 停止 -> 解除堵转保护 -> 当前位置设为0点(归零校准) */
+    /* 撞到限位: 停止 -> 解除堵转保护 -> 重新使能 -> 当前位置设为0点 */
     motor_stop();
     DDL_DelayMS(20);
     motor_clear_alarm();
     DDL_DelayMS(20);
+    motor_enable(1);              /* 0x0E 之后驱动会失能, 必须重新使能,
+                                   * 否则后面的 FD 运动指令只回 ACK 但电机不动 */
+    DDL_DelayMS(50);
     motor_zero_pos();
     return 1U;
 }
@@ -294,9 +299,12 @@ void motor_limit_task(void)
     if (cur == 0U) {
         motor_stop();
         DDL_DelayMS(20);
-        motor_clear_alarm();
+        motor_clear_alarm();              /* 解除堵转保护 */
         DDL_DelayMS(20);
-        motor_zero_pos();
+        motor_enable(1);                  /* 0x0E 之后驱动可能失能, 必须重新使能 */
+        DDL_DelayMS(20);
+        /* 这里不再 motor_zero_pos(): 运行中清零会把 0x32 坐标系整体挪走,
+         * 后续所有绝对目标都会算错(表现为"走到一半停住/超时")。 */
     }
 
     s_limit_last = cur;
@@ -589,15 +597,18 @@ void motor_rx_task(void)
         return;                                  /* 帧对不上, 丢弃 */
     }
 
-    /* 返回码白名单: 防止 8 字节读取应答的残留被误判成主动帧 */
-    if ((b[2] != 0x02U) && (b[2] != 0x12U) && (b[2] != 0x9FU) &&
-        (b[2] != 0xE2U) && (b[2] != 0xEEU)) {
+    /* 返回码白名单: 防止 8 字节读取应答的残留被误判成主动帧。
+     * 注意返回码在 b[1](帧格式: addr code status chk), 原来查 b[2] 是错的,
+     * 导致 9F 到位帧永远认不出来。
+     */
+    if ((b[1] != 0x02U) && (b[1] != 0x12U) && (b[1] != 0x9FU) &&
+        (b[1] != 0xE2U) && (b[1] != 0xEEU)) {
         return;
     }
-    g_motor_last_reply = b[2];
-    if (b[2] == 0x9FU) {                         /* 到位 / 回零完成 */
+    g_motor_last_reply = b[1];
+    if (b[1] == 0x9FU) {                         /* 到位 / 回零完成 */
         g_motor_done_cnt++;
-    } else if ((b[2] == 0xE2U) || (b[2] == 0xEEU)) {
+    } else if ((b[1] == 0xE2U) || (b[1] == 0xEEU)) {
         g_motor_err_cnt++;                       /* 参数错 / 格式错 / 保护触发 */
     }
 }

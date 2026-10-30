@@ -165,11 +165,6 @@ void     check_clear_overcurrent(void)   { g_check_oc = 0U; }
 /* ------------------------- 过流动作 ------------------------- */
 __WEAKDEF void check_overcurrent_action(void)
 {
-    /* 默认什么都不做; 在 main.c 里重写它即可, 例如:
-     *   servo_stop(SERVO_ID_DEFAULT);
-     *   motor_stop();
-     */
-    servo_pause();
-    servo_center(); 
-    /*can上报*/
+    /* 总轨 2.5A: L3 致命 -> 立即急停(步进失能 + 舵机释放) 并上报 0x89 */
+    can_raise_fault(CANP_F_OVERCURRENT, CANP_LV_FATAL, CANP_SRC_POWER, check_current_ma());
 }
