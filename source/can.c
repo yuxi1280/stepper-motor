@@ -191,10 +191,31 @@ static int32_t can_read_pos(void)
  * 目标 0 是正号 -> 方向反了。这里读一次当前位置, 用"目标-当前"决定方向。
  * 返回位移; 位置读不到时用上次已知位置兜底, 保证指令一定会发出去。
  */
+/* 运动前确认驱动没锁在保护态:
+ * 堵转/过流/掉电保护一旦触发, 后续 FD 指令会被静默丢弃(电机不动作),
+ * 表现就是"前面几个工位都好的, 突然某一个工位不动 / 回 0 不动"。
+ */
+static void can_driver_ready(void)
+{
+    uint8_t st = motor_read_status(MOTOR_RX_TIMEOUT_MS);
+
+    if ((st != 0xFFU) &&
+        ((st & (MOTOR_ST_CGP_TF | MOTOR_ST_CGI_TF | MOTOR_ST_OAC_TF)) != 0U)) {
+        motor_stop();
+        DDL_DelayMS(20U);
+        motor_clear_alarm();
+        DDL_DelayMS(20U);
+        motor_enable(1U);
+        DDL_DelayMS(50U);
+    }
+}
+
 static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
 {
     int32_t cur;
     int32_t d;
+
+    can_driver_ready();                    /* 有保护先解除, 否则指令发下去也不动 */
 
     cur = can_read_pos();
     if (cur == MOTOR_ERR_TIMEOUT) {

@@ -125,12 +125,19 @@ static void uart_suspend_handle(void)
 {
 }
 
-/* 启动发送: 若缓冲非空, 写首字节并开 TXE 中断 */
+/* 启动发送: 只在发送寄存器空(TXE=1)时才写首字节, 其余交给 TXE 中断逐个推进。
+ * 发送器忙时硬写 TDR 会把该字节吃掉, 整条命令变残帧被驱动丢弃,
+ * 表现就是"偶尔一条运动指令不执行, 电机不动"(舵机那边同样的 bug 已修)。
+ */
 static void start_tx(void)
 {
     uint32_t head;
 
     if (g_uart0.t_buf->head == g_uart0.t_buf->tail) {
+        return;
+    }
+    if (USART_GetStatus(CM_USART1, USART_FLAG_TX_EMPTY) == RESET) {
+        USART_FuncCmd(CM_USART1, USART_INT_TX_EMPTY, ENABLE);   /* 忙: 等中断来取 */
         return;
     }
     head = g_uart0.t_buf->head;

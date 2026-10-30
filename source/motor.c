@@ -195,6 +195,12 @@ static uint8_t motor_limit_home_once(void)
 {
     uint32_t tick = 0U;
 
+    /* 开机先解除上一次留下的堵转/过流保护, 再使能;
+     * 否则驱动锁在保护态, 速度模式也不会转, 表现为"只有信息、电机不动",
+     * 然后 30s 回零超时。
+     */
+    motor_clear_alarm();
+    DDL_DelayMS(20);
     motor_enable(1);
     DDL_DelayMS(100);
 
