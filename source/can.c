@@ -111,6 +111,9 @@ static int32_t  s_moveStart;              /* 下发运动时的位置 */
 static int32_t  s_moveWant;               /* 本次该走的脉冲数(带符号) */
 static uint16_t s_doneAtMove;             /* 下发运动时的 9F 到位计数 */
 static uint32_t s_posChkMs;               /* 上次位置核对时刻 */
+static uint8_t  s_moveRetry;              /* 本次运动已重发次数(最多 2 次) */
+static uint32_t s_moveTmo;                /* 本次运动超时时间(重发后自动延长) */
+static uint32_t s_moveLastAct;            /* 上次"下发/重发"指令的时刻 */
 
 /* ================= 小工具 ================= */
 static uint8_t can_next_seq(void)
@@ -219,13 +222,20 @@ static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
 
     cur = can_read_pos();
     if (cur == MOTOR_ERR_TIMEOUT) {
-        cur = s_lastPulse;                 /* 读不到就用上次已知位置, 指令照发 */
+        /* 读不到位置就绝不发指令: 拿旧值硬算, 方向和距离都可能错
+         * (表现为往反方向跑 / 撞极限 / 15 秒超时)。返回 INT32_MIN 让调用方马上报错。
+         */
+        return INT32_MIN;
     }
     d = target - cur;
     s_moveStart = cur;                     /* 记下出发位置 */
     s_moveWant  = d;                       /* 记下"该走多少脉冲" */
     s_doneAtMove = g_motor_done_cnt;       /* 记下出发时的到位计数 */
     s_posChkMs   = SysTick_GetTick();
+    s_moveRetry  = 0U;                     /* 本次运动还没重发过 */
+    s_moveTmo    = CAN_MOVE_TIMEOUT_MS;
+    s_moveLastAct = SysTick_GetTick();     /* 记下发指令的时刻 */
+    g_motor_last_reply = 0U; 
     if (d > 0) {
         motor_move(0, (uint32_t)d, rpm, acc, MOTOR_MODE_REL_CUR, 0U);
     } else if (d < 0) {
@@ -246,7 +256,7 @@ static uint8_t can_moved_ok(void)
     int32_t moved;
     int32_t want;
 
-    cur = motor_read_input_pulses(MOTOR_RX_TIMEOUT_MS);
+    cur = can_read_pos();                  /* 带清缓冲+重试, 避免残留字节导致错位 */
     if (cur == MOTOR_ERR_TIMEOUT) {
         return 0U;                         /* 本次没读到, 下一轮再试 */
     }
@@ -261,11 +271,16 @@ static uint8_t can_moved_ok(void)
     return 0U;
 }
 
-/* 舵机等待: 阻塞, 但仍持续解析舵机应答, 避免接收缓冲堆满 */
+/* 舵机等待: 阻塞, 但同时解析舵机应答和电机应答。
+ * 电机每完成一个动作都会主动发 4 字节 0x9F 到位帧, 这 2 秒里如果没人收,
+ * 下一动作前的 motor_flush_rx() 就会把它清掉 -> 9F 计数永远是 0 ->
+ * 到位判定只能靠不稳的读位置 -> 频繁 0x0A。
+ */
 static void can_servo_delay(uint32_t ms)
 {
     while (ms-- > 0U) {
         servo_rx_task();
+        motor_rx_task();               /* ← 及时收 9F 到位帧 */
         DDL_DelayMS(1U);
     }
 }
@@ -289,7 +304,9 @@ static uint8_t can_move_wait(int32_t pulse, uint16_t rpm, uint8_t acc)
     uint32_t el;
     uint32_t chk = 0U;
 
-    (void)can_move_to(pulse, rpm, acc);       /* 相对运动, 方向按差值算 */
+    if (can_move_to(pulse, rpm, acc) == INT32_MIN) {
+        return 0U;                            /* 位置读不到: 本次不动, 直接判失败 */
+    }
     t0 = SysTick_GetTick();
     for (;;) {
         el = SysTick_GetTick() - t0;
@@ -324,7 +341,24 @@ static void can_start_park(uint8_t after_task)
 
     s_targetPulse = s_zeroRef;             /* 0 点 = 回零时记下的读数, 不假设它是 0 */
     d = can_move_to(s_zeroRef, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
-    s_moveMinMs = can_move_min_ms((d == INT32_MIN) ? 0 : d);
+    if (d == INT32_MIN) {
+        /* 位置读不到: 立刻判回 0 失败, 不要傻等 15 秒 */
+        s_parkMode = 0U;
+        s_state    = CANP_ST_IDLE;
+        if (after_task != 0U) {
+            s_result = CANP_DONE_PARK_FAIL;
+            s_exec   = EXEC_DONE;
+        } else {
+            uint8_t r[3];
+            r[0] = CANP_GZ_FAIL;
+            r[1] = 0U;
+            r[2] = 0U;
+            can_tx_msg(CANP_R_GOZERO, s_parkSeq, r, 3U);
+            s_exec = EXEC_IDLE;
+        }
+        return;
+    }
+    s_moveMinMs = can_move_min_ms(d);
     s_parkMode  = 1U;
     s_parkAfter = after_task;
     s_moveT0    = SysTick_GetTick();
@@ -1068,7 +1102,16 @@ static void can_exec_task(void)
 
             s_targetPulse = pulse;
             d = can_move_to(pulse, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
-            s_moveMinMs = can_move_min_ms((d == INT32_MIN) ? 0 : d);
+            if (d == INT32_MIN) {
+                /* 位置读不到: 不瞎走, 直接报位置异常并中止本包(参数 1 = 位置读取失败) */
+                s_fault   = CANP_F_POSITION;
+                s_faultLv = CANP_LV_ERR;
+                can_report_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR, 1U);
+                s_result  = CANP_DONE_MOVE_FAIL;
+                s_exec    = EXEC_DONE;
+                break;
+            }
+            s_moveMinMs = can_move_min_ms(d);
             s_moveT0 = now;
             s_state  = CANP_ST_MOVING;
             s_exec   = EXEC_WAIT;
@@ -1113,7 +1156,33 @@ static void can_exec_task(void)
                     s_settleT0 = now;
                     s_exec     = EXEC_SETTLE;    /* 再稳定一下才动舵机 */
                 }
-            } else if ((now - s_moveT0) > CAN_MOVE_TIMEOUT_MS) {
+            } else if ((s_moveRetry < 2U) &&
+                       ((now - s_moveLastAct) > (s_moveMinMs + 800U))) {
+                /* 下发后过了"理论时间 + 0.8 秒", 位置几乎没变(容差 3mm):
+                 * 判定驱动没收到这条指令(偶发丢帧), 原样重发, 最多 2 次。
+                 * 注意判据用容差而不是"完全相等": 实际停车常有 1~2mm 偏差,
+                 * 用相等判断会导致该重发的时候不重发。
+                 */
+                int32_t cur = can_read_pos();
+
+                if ((cur != MOTOR_ERR_TIMEOUT) &&
+                    (cur > (s_moveStart - CAN_POS_TOL_PULSE)) &&
+                    (cur < (s_moveStart + CAN_POS_TOL_PULSE))) {
+                    s_moveRetry++;
+                    can_driver_ready();
+                    if (s_moveWant > 0) {
+                        motor_move(0, (uint32_t)s_moveWant, POS_RPM, POS_ACC,
+                                   MOTOR_MODE_REL_CUR, 0U);
+                    } else if (s_moveWant < 0) {
+                        motor_move(1, (uint32_t)(-s_moveWant), POS_RPM, POS_ACC,
+                                   MOTOR_MODE_REL_CUR, 0U);
+                    }
+                    s_doneAtMove  = g_motor_done_cnt;  /* 旧计数别误触发 */
+                    s_posChkMs    = now;
+                    s_moveLastAct = now;               /* 下次重发至少隔 minMs+0.8s */
+                    s_moveTmo    += 6000U;             /* 超时相应延长 */
+                }
+            } else if ((now - s_moveT0) > s_moveTmo) {
                 int32_t act = motor_read_input_pulses(MOTOR_RX_TIMEOUT_MS);
                 int32_t amm = (act == MOTOR_ERR_TIMEOUT)
                               ? 0x7FFF

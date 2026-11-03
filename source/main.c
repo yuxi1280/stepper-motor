@@ -175,11 +175,7 @@ static void App_IntCfg(void)
 
 
 
-/**
- * @brief  Main function of the project
- * @param  None
- * @retval int32_t return value, if needed
- */
+
 int main(void)
 {
     /* Register write unprotected for some required peripherals. */
@@ -223,8 +219,8 @@ int main(void)
         motor_limit_task();     
         motor_rx_task(); 
         servo_rx_task();  
-        check_task();          /* 总轨电流采样/过流判定 */
-        can_task();            /* CAN 收包 + 任务队列 + 自检调度 */
+        check_task();     
+        can_task();           
 
                  
 

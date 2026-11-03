@@ -368,29 +368,58 @@ uint16_t motor_rx_available(void)
     return uart_rx_count(MOTOR_UART_IDX);
 }
 
-/* 定长收帧: 期望 buf[0]=地址, buf[1]=功能码, buf[len-1]=校验 */
+/* 定长收帧(滑动重同步 + 字节预算):
+ * 期望 buf[0]=地址, buf[1]=功能码, buf[len-1]=校验。
+ *
+ * 原来的写法是"收满 len 字节, 校验不对就整帧丢弃", 残留字节会污染下一次读取;
+ * 一旦错位, 后面几十次读位置全部失败(表现为 0x0A 且 PARAM=0x7FFF 连成一片)。
+ * 现在改成滑动窗口: 不在帧头就丢 1 字节继续找, 校验不过也只退 1 字节。
+ *
+ * 同时必须保留"字节预算": 线路上一直有杂波时不能无限循环, 否则主循环会卡死。
+ */
 static uint8_t motor_read_frame(uint8_t code, uint8_t *buf, uint8_t len, uint32_t timeout_ms)
 {
-    uint32_t idle = 0U;
+    uint32_t idle   = 0U;
+    uint32_t budget = ((uint32_t)len * 4U) + 32U;   /* 硬预算: len=8 时最多处理 64 字节 */
     uint8_t  n = 0U;
+    uint8_t  i;
     int16_t  c;
 
-    while (n < len) {
+    while (budget != 0U) {
         c = uart_recv_byte(MOTOR_UART_IDX);
-        if (c >= 0) {
-            buf[n++] = (uint8_t)c;
-            idle = 0U;
+        if (c < 0) {
+            if (++idle > timeout_ms) {      /* 字节间断太久: 认为没有应答 */
+                return 0U;
+            }
+            DDL_DelayMS(1);
             continue;
         }
-        if (++idle > timeout_ms) {          /* 字节间断太久: 认为没有应答 */
-            return 0U;
+        idle = 0U;
+        budget--;
+
+        if ((n == 0U) && ((uint8_t)c != s_motor_addr)) {
+            continue;                        /* 不在帧头: 丢掉这个字节 */
         }
-        DDL_DelayMS(1);
+        if (n >= len) {                      /* 缓冲满还没对上: 左移 1 字节 */
+            for (i = 1U; i < len; i++) {
+                buf[i - 1U] = buf[i];
+            }
+            n = (uint8_t)(len - 1U);
+        }
+        buf[n++] = (uint8_t)c;
+        if (n < len) {
+            continue;
+        }
+        if ((buf[0] == s_motor_addr) && (buf[1] == code) && (buf[len - 1U] == s_motor_chk)) {
+            return 1U;                       /* 完整且校验通过 */
+        }
+        /* 校验不过: 只退 1 字节, 继续在同一窗口里找真正的帧头 */
+        for (i = 1U; i < len; i++) {
+            buf[i - 1U] = buf[i];
+        }
+        n = (uint8_t)(len - 1U);
     }
-    if ((buf[0] != s_motor_addr) || (buf[1] != code) || (buf[len - 1U] != s_motor_chk)) {
-        return 0U;                          /* 地址/功能码/校验任一不符: 丢弃 */
-    }
-    return 1U;
+    return 0U;                               /* 预算用完还没对上: 放弃本次, 绝不在这里死等 */
 }
 
 /* 发查询 + 收应答; 成功返回帧长(数据在 buf[2..len-2]), 失败返回 0 */

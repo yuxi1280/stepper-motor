@@ -73,8 +73,8 @@ targets:
     uploadConfigMap:
       Custom:
         bin: ""
-        commandLine: pyocd flash --connect=under-reset --no-uninit -t hc32f460xe --config ".eide\debug.pyocd.yaml" "${ExecutableName}.hex"
-        eraseChipCommand: ""
+        commandLine: pyocd flash -t hc32f460xe --erase chip "${ExecutableName}.hex"
+        eraseChipCommand: pyocd erase -t hc32f460xe --chip
       JLink:
         baseAddr: ""
         bin: ""
