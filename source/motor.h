@@ -114,6 +114,11 @@ void motor_goto_point(uint8_t n);   /* 去第 n 个工位(n 从 1 开始), 内�
 #define MOTOR_RX_FRAME_MAX    (8U)    /* 手册里最长返回帧 8 字节 */
 #define MOTOR_ERR_TIMEOUT     (INT32_MIN)  /* 读取失败的返回值 */
 
+/* 串口接收自愈: 连续这么多次收不到应答, 就重新初始化一次 USART1。
+ * 针对"电机能收能动作、但上位机一个字节都收不到, 只有断电重启才恢复"的锁死现象。
+ */
+#define MOTOR_RX_FAIL_REINIT  (6U)
+
 /* 电机状态标志(0x3A) */
 #define MOTOR_ST_OAC_TF       (0x80U) /* 掉电标志 */
 #define MOTOR_ST_ESI_RF       (0x20U) /* 右限位 */

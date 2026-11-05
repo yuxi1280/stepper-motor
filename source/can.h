@@ -42,6 +42,7 @@
 #define CAN_MOVE_EXTRA_PCT      (140U)    /* 理论时间 * 1.4 (留加速与余量) */
 #define CAN_MOVE_MIN_MS         (300U)    /* 每段最短等待 */
 #define CAN_POS_TOL_PULSE       (200)     /* 到位位置容差(约 3mm) */
+#define CAN_READ_RETRY_MAX      (3U)      /* 读位置失败后最多再重试几轮(每轮约 200ms) */
 #define CAN_ARRIVE_SETTLE_MS    (150U)    /* 到位后稳定时间再动舵机 */
 
 /* ---- 舵机动作时序(每个工位一轮) ----
@@ -58,6 +59,10 @@
 /* ---- 初始化 / 主循环 ---- */
 void can_init(void);                       /* 时钟、位时序、过滤器、中断 */
 void can_task(void);                       /* 主循环每轮调用: 收包/调度/心跳/执行 */
+/* 阻塞期间的服务: 收 CAN 并派发(查询类应答) + 跑串口任务, 长了动作也不失联。
+ * 已自动注册到 app_service(), motor.c/lc.c 的阻塞循环里调 app_service() 即可。
+ */
+void can_idle(void);
 
 /* ---- 发送 ---- */
 void can_tx_msg(uint8_t cmd, uint8_t seq, const uint8_t *p, uint8_t len);

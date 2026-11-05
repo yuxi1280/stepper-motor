@@ -176,6 +176,24 @@ static void App_IntCfg(void)
 
 
 
+/* ================= 阻塞期服务回调 =================
+ * can.c 在初始化时把"收 CAN + 跑串口任务"注册进来,
+ * 长阻塞循环(motor.c 回零 / lc.c 扫描)里调 app_service() 就能保持通讯。
+ */
+static app_service_fn_t s_appService = NULL;
+
+void app_set_service(app_service_fn_t fn)
+{
+    s_appService = fn;
+}
+
+void app_service(void)
+{
+    if (s_appService != NULL) {
+        s_appService();
+    }
+}
+
 int main(void)
 {
     /* Register write unprotected for some required peripherals. */

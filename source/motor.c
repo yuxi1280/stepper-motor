@@ -12,6 +12,7 @@
 
 static uint8_t s_motor_addr = MOTOR_ADDR_DEFAULT;
 static uint8_t s_motor_chk  = MOTOR_CHECK_BYTE;
+static uint8_t s_rxFailCnt  = 0U;        /* 连续收不到应答的次数(用于串口自愈) */
 
 /* ================= 初始化: 限位输入 GPIO (PB4) ================= */
 void motor_init(void)
@@ -220,6 +221,7 @@ static uint8_t motor_limit_home_once(void)
     motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);
 
     while (motor_limit_active() == 0U) {
+        app_service();                 /* 回零最长 30 秒, 期间照样应答上位机 */
         DDL_DelayMS(1);
         if (++tick >= MOTOR_LIMIT_TIMEOUT_MS) {
             motor_stop();
@@ -422,23 +424,42 @@ static uint8_t motor_read_frame(uint8_t code, uint8_t *buf, uint8_t len, uint32_
     return 0U;                               /* 预算用完还没对上: 放弃本次, 绝不在这里死等 */
 }
 
-/* 发查询 + 收应答; 成功返回帧长(数据在 buf[2..len-2]), 失败返回 0 */
+/* 发查询 + 收应答; 成功返回帧长(数据在 buf[2..len-2]), 失败返回 0
+ *
+ * 自愈: 连续 MOTOR_RX_FAIL_REINIT 次收不到应答时, 判定 MCU 的 USART1 接收端锁死
+ * (现象: 电机能收指令能动作, 但上位机一个字节都收不到, 只有断电重启才恢复),
+ * 这里主动重新初始化一次串口, 然后立刻重试本次查询。
+ */
 static uint8_t motor_query(uint8_t code, uint8_t *buf, uint32_t timeout_ms)
 {
     uint8_t len = motor_reply_len(code);
+    uint8_t retry = 0U;
 
     if (len > MOTOR_RX_FRAME_MAX) {
         len = MOTOR_RX_FRAME_MAX;
     }
-    s_motor_reading = 1U;
-    motor_flush_rx();                       /* 清残留, 保证从帧头开始收 */
-    motor_tx(s_motor_addr, code, NULL, 0U);
-    if (motor_read_frame(code, buf, len, timeout_ms) == 0U) {
+
+    for (retry = 0U; retry < 2U; retry++) {
+        s_motor_reading = 1U;
+        motor_flush_rx();                   /* 清残留, 保证从帧头开始收 */
+        motor_tx(s_motor_addr, code, NULL, 0U);
+        if (motor_read_frame(code, buf, len, timeout_ms) != 0U) {
+            s_motor_reading = 0U;
+            s_rxFailCnt    = 0U;
+            return len;                     /* 收到, 正常返回 */
+        }
         s_motor_reading = 0U;
-        return 0U;
+
+        if (++s_rxFailCnt < MOTOR_RX_FAIL_REINIT) {
+            return 0U;                      /* 偶发失败: 交给上层重试 */
+        }
+
+        /* 连续多次收不到: 重新初始化 USART1, 然后重试一次 */
+        s_rxFailCnt = 0U;
+        uart_driver_init();
+        DDL_DelayMS(10U);
     }
-    s_motor_reading = 0U;
-    return len;
+    return 0U;
 }
 
 /* 符号 + 4 字节大端值 -> int32 (0x32/0x33/0x34/0x36/0x37 通用) */

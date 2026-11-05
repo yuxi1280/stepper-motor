@@ -245,6 +245,15 @@ static uint8_t lc_return_zero(void)
 
     can_report_event(CANP_EV_RETURN0, 0U, 0U);
 
+    /* 回 0 前先"解锁"驱动: 扫描末期如果顶到机械末端, 驱动会锁存堵转保护,
+     * 之后的运动指令全部被忽略 -> 回 0 一直不动 -> 30 秒超时。
+     * 这是"扫描到最远端之后卡很久才回零 / 干脆回不去"的直接原因。
+     */
+    motor_clear_alarm();
+    DDL_DelayMS(20U);
+    motor_enable(1);
+    DDL_DelayMS(50U);
+
     motor_flush_rx();                      /* 丢掉上一轮 motor_stop 的残留应答 */
     DDL_DelayMS(50U);
 
@@ -274,6 +283,7 @@ static uint8_t lc_return_zero(void)
     }
 
     while (t < LC_RETURN_TIMEOUT_MS) {
+        app_service();                      /* 回零最长 30 秒, 期间照样应答上位机 */
         DDL_DelayMS(20U);
         t += 20U;
 
@@ -322,12 +332,19 @@ static uint8_t lc_scan_pass(uint8_t pass)
     /* RESULT = 本轮开始时传感器电平(诊断用), DETAIL = 轮次 */
     can_report_event(CANP_EV_PASS_START, last_act, pass);
 
-    motor_enable(1);                      /* 保险: 每轮开始前确保驱动已使能 */
-    DDL_DelayMS(30U);
+    /* 每轮开始前先把驱动"解锁": 只发 enable 是不够的,
+     * 堵转/过流保护一旦锁存, enable 会被忽略 -> 指令发下去电机不动
+     * (表现就是"标定只接收不动作")。
+     */
+    motor_clear_alarm();
+    DDL_DelayMS(20U);
+    motor_enable(1);
+    DDL_DelayMS(50U);
     motor_flush_rx();
     lc_move_forward(LC_TARGET_PULSE);
 
     for (;;) {
+        app_service();                      /* 扫描 20 多秒, 期间照样应答上位机 */
         DDL_DelayMS(LC_POLL_MS);
         t_ms += LC_POLL_MS;
 
@@ -859,8 +876,18 @@ static lc_result_t lc_scan_all(uint8_t do_home)
     for (pass = 0U; pass < LC_PASS_MAX; pass++) {
         if (pass > 0U) {
             if (lc_return_zero() == 0U) {
-                res = LC_RESULT_TIMEOUT;
-                break;
+                /* 快速回 0 失败(位置读不到 + 限位没触发): 改用慢速撞限位。
+                 * 它自带"解除保护 + 使能 + 重试", 1400mm @64mm/s 约 22 秒,
+                 * 比直接放弃可靠得多, 否则这台设备上标定永远过不去。
+                 */
+                if (motor_limit_home() == 0U) {
+                    res = LC_RESULT_TIMEOUT;
+                    break;
+                }
+                /* 回零已完成 0x0A 清零, 坐标就是 0 */
+                s_base_pulse = 0;
+                s_zero_pulse = 0;
+                can_report_event(CANP_EV_RETURN0, 2U, 0U);
             }
         }
         if (lc_scan_pass(pass) == 0U) {

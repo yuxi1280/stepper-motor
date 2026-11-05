@@ -15,6 +15,7 @@
 #include "lc.h"
 #include "servo.h"
 #include "check.h"
+#include "uart.h"
 #include <string.h>
 
 /* ================= 内部帧结构 ================= */
@@ -56,6 +57,8 @@ static volatile uint32_t s_dbgLastId;
 static uint32_t          s_dbgT0;
 
 static void can_hw_config(void);
+static void can_rx_process(void);
+static void can_servo_delay(uint32_t ms);
 
 /* ================= 设备状态 ================= */
 static uint8_t s_txSeq;                   /* 设备主动帧的序号 */
@@ -112,6 +115,7 @@ static int32_t  s_moveWant;               /* 本次该走的脉冲数(带符号)
 static uint16_t s_doneAtMove;             /* 下发运动时的 9F 到位计数 */
 static uint32_t s_posChkMs;               /* 上次位置核对时刻 */
 static uint8_t  s_moveRetry;              /* 本次运动已重发次数(最多 2 次) */
+static uint8_t  s_readRetry;              /* 读位置失败后的重试轮数 */
 static uint32_t s_moveTmo;                /* 本次运动超时时间(重发后自动延长) */
 static uint32_t s_moveLastAct;            /* 上次"下发/重发"指令的时刻 */
 
@@ -213,6 +217,37 @@ static void can_driver_ready(void)
     }
 }
 
+/* 串口 + 驱动的"软复位"。
+ * 标定/扫描过程中会高频查询位置, 驱动或 MCU 的应答通道可能卡住:
+ * 现象是之后所有读位置都超时, 任务全部 PARAM=1 失败, 只有断电重启才恢复。
+ * 这里重新初始化 USART1 并重新使能驱动, 不用断电就能恢复。
+ */
+static void can_serial_recover(void)
+{
+    uint8_t i;
+
+    /* 最多试 4 轮: 每轮重置串口 + 解锁驱动, 然后**实际读一次位置来验证**。
+     * 标定这种连续长时间动作之后, 应答通道可能卡住,
+     * 不验证的话会出现"自检说恢复好了, 实际读位置还是全失败"。
+     */
+    for (i = 0U; i < 4U; i++) {
+        uart_driver_init();                /* 重置 USART1(DeInit + 重新初始化) */
+        DDL_DelayMS(50U);
+        motor_flush_rx();
+        motor_clear_alarm();               /* 解除可能锁存的保护 */
+        DDL_DelayMS(20U);
+        motor_enable(1U);                  /* 0x0E 之后必须重新使能 */
+        DDL_DelayMS(100U);
+
+        if (motor_read_input_pulses(60U) != MOTOR_ERR_TIMEOUT) {
+            motor_flush_rx();
+            return;                        /* 读到了: 通道已恢复 */
+        }
+        DDL_DelayMS(100U);
+    }
+    motor_flush_rx();
+}
+
 static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
 {
     int32_t cur;
@@ -276,11 +311,27 @@ static uint8_t can_moved_ok(void)
  * 下一动作前的 motor_flush_rx() 就会把它清掉 -> 9F 计数永远是 0 ->
  * 到位判定只能靠不稳的读位置 -> 频繁 0x0A。
  */
+/* 阻塞期间的"服务": 收 CAN 并派发(查询类照样应答) + 跑两个串口任务。
+ * 带重入保护: 在 can_idle 内部又触发阻塞时不重复递归。
+ */
+void can_idle(void)
+{
+    static uint8_t s_busy = 0U;
+
+    if (s_busy != 0U) {
+        return;
+    }
+    s_busy = 1U;
+    can_rx_process();                      /* 上位机的 PING/状态/调试 都能回 */
+    motor_rx_task();                       /* 收驱动的 9F 到位帧 / ACK */
+    servo_rx_task();                       /* 收舵机应答 */
+    s_busy = 0U;
+}
+
 static void can_servo_delay(uint32_t ms)
 {
     while (ms-- > 0U) {
-        servo_rx_task();
-        motor_rx_task();               /* ← 及时收 9F 到位帧 */
+        can_idle();                        /* 舵机动作 2 秒里也保持通讯 */
         DDL_DelayMS(1U);
     }
 }
@@ -313,7 +364,7 @@ static uint8_t can_move_wait(int32_t pulse, uint16_t rpm, uint8_t acc)
         if (el >= CAN_MOVE_TIMEOUT_MS) {
             break;
         }
-        motor_rx_task();                      /* 收驱动的 9F 到位帧 */
+        can_idle();                           /* 收 9F + 服务 CAN(最长 15 秒不失联) */
         if (g_motor_done_cnt != s_doneAtMove) {
             s_lastPulse = pulse;
             return 1U;
@@ -337,12 +388,22 @@ static uint8_t can_move_wait(int32_t pulse, uint16_t rpm, uint8_t acc)
  */
 static void can_start_park(uint8_t after_task)
 {
-    int32_t d;
+    int32_t d = INT32_MIN;
+    uint8_t i;
 
     s_targetPulse = s_zeroRef;             /* 0 点 = 回零时记下的读数, 不假设它是 0 */
-    d = can_move_to(s_zeroRef, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
+
+    /* 读位置失败时多试几轮: 偶发的一次抖动不该让整包任务回不了 0 */
+    for (i = 0U; i <= CAN_READ_RETRY_MAX; i++) {
+        d = can_move_to(s_zeroRef, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
+        if (d != INT32_MIN) {
+            break;
+        }
+        DDL_DelayMS(30U);
+    }
+
     if (d == INT32_MIN) {
-        /* 位置读不到: 立刻判回 0 失败, 不要傻等 15 秒 */
+        /* 多轮都读不到: 判回 0 失败, 不要傻等 15 秒 */
         s_parkMode = 0U;
         s_state    = CANP_ST_IDLE;
         if (after_task != 0U) {
@@ -901,6 +962,17 @@ static void can_handle_fault_clear(uint8_t seq)
     motor_enable(1);                        /* 软件重新使能, 本机无电源开关 */
     servo_restore();
 
+    /* 强制复位执行状态机: 万一卡在 EXEC_WAIT/SETTLE/SERVO, 先回到 IDLE,
+     * 否则清完故障后状态仍然"忙", 后面发什么都进不来。
+     */
+    motor_stop();
+    DDL_DelayMS(20U);
+    s_exec     = EXEC_IDLE;
+    s_parkMode = 0U;
+    s_qCnt     = 0U;
+    s_qHead    = 0U;
+    s_qTail    = 0U;
+
     s_fault         = 0U;
     s_faultLv       = 0U;
     s_commLost      = 0U;
@@ -944,12 +1016,17 @@ static void can_handle_recal(uint8_t seq)
         return;
     }
     (void)lc_ref_save();
-    (void)can_move_wait(s_zeroRef, LC_RETURN_RPM, LC_SCAN_ACC);       /* 标定完回 0 位 */
-    (void)lc_set_base();
-    s_zeroRef  = lc_get_base();            /* 重新回零过, 刷新 0 点坐标 */
+    /* 标定完回 0 位: 同样直接用限位慢速回零, 长度确定、必定成功 */
+    s_state = CANP_ST_HOMING;
+    if (motor_limit_home() != 0U) {
+        (void)lc_set_base();
+        s_zeroRef = lc_get_base();         /* 重新回零过, 刷新 0 点坐标 */
+    }
     s_lastPulse = s_zeroRef;
     s_lastSlot = 0U;
     s_state    = CANP_ST_IDLE;
+
+    can_serial_recover();                  /* 标定后软复位串口/驱动, 否则读位置会全失败 */
 
     d[0] = CANP_RECAL_DONE;
     d[1] = 0U;
@@ -960,6 +1037,45 @@ static void can_handle_recal(uint8_t seq)
 static void can_dispatch(uint8_t cmd, uint8_t seq, const uint8_t *d, uint8_t len)
 {
     s_dbgDis++;
+
+    /* 只在"自检/回零/标定"这三种独占电机的长动作期间做指令隔离,
+     * 避免 03/07/09 和正在跑的动作抢电机。
+     * 04(停止) 和 05(清故障) 永远放行 —— 卡住时唯一的自救手段。
+     *
+     * 关键: 被拒绝的指令一律回一个"拒绝"应答, 绝不静默丢弃,
+     * 否则上位机会以为设备死了(之前就是这样: 标定期间发 09 毫无反应)。
+     */
+    if ((s_state == CANP_ST_SELFCHECK) || (s_state == CANP_ST_HOMING) ||
+        (s_state == CANP_ST_CALIB)) {
+        if (cmd == CANP_C_TASK) {
+            uint8_t r[3];
+            r[0] = CANP_ACK_PARAM;             /* 自检中: 任务拒收 */
+            r[1] = 0U;
+            r[2] = 0U;
+            can_tx_msg(CANP_R_TASK_ACK, seq, r, 3U);
+            return;
+        }
+        if (cmd == CANP_C_GOZERO) {
+            uint8_t r[3];
+            r[0] = CANP_GZ_BUSY;               /* 忙: 拒绝去 0 */
+            r[1] = 0U;
+            r[2] = 0U;
+            can_tx_msg(CANP_R_GOZERO, seq, r, 3U);
+            return;
+        }
+        if (cmd == CANP_C_RECAL) {
+            uint8_t r[2];
+            r[0] = CANP_RECAL_FAIL;
+            r[1] = CANP_F_PARAM;
+            can_tx_msg(CANP_R_RECAL, seq, r, 2U);
+            return;
+        }
+        if ((cmd != CANP_C_PING) && (cmd != CANP_C_INFO) && (cmd != CANP_C_STATUS) &&
+            (cmd != CANP_C_DEBUG) && (cmd != CANP_C_COMP_GET) &&
+            (cmd != CANP_C_STOP) && (cmd != CANP_C_FAULT_CLR)) {
+            return;
+        }
+    }
 
     switch (cmd) {
         case CANP_C_DEBUG:    can_report_debug();                 break;
@@ -987,6 +1103,7 @@ static void can_boot_run(void)
 {
     lc_result_t r;
     uint8_t     phase;
+    uint8_t     baseOk = 1U;               /* 0=回零后读不到位置, 已用 0 兜底 */
 
     can_report_event(CANP_EV_SELF_START, 0U, 0U);
 
@@ -1003,13 +1120,21 @@ static void can_boot_run(void)
     if (lc_set_base() == 0U) {             /* 记录回零位读数, 扫描起点判据 */
         DDL_DelayMS(200U);
         if (lc_set_base() == 0U) {
-            can_report_event(CANP_EV_SELF_ABORT, CANP_F_SELFTEST, 2U);
-            can_raise_fault(CANP_F_SELFTEST, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
-            return;
+            can_serial_recover();          /* 读不到: 先恢复串口/驱动, 再试一次 */
+            if (lc_set_base() == 0U) {
+                /* 恢复后仍然读不到: 回零时刚做过 0x0A 坐标清零,
+                 * 当前位置就是 0, 用 0 兜底继续, 不判 L3 锁死。
+                 */
+                motor_zero_pos();          /* 再确认一次坐标零点 */
+                DDL_DelayMS(30U);
+                baseOk = 0U;
+                can_report_fault(CANP_F_SELFTEST, CANP_LV_WARN, CANP_SRC_MOTOR, 3U);
+            }
         }
     }
     s_lastSlot    = 0U;
-    s_zeroRef     = lc_get_base();         /* 回零位在 0x32 坐标系里的读数 = 真正的 0 点 */
+    /* 回零位在 0x32 坐标系里的读数 = 真正的 0 点; 读不到时按 0 处理 */
+    s_zeroRef     = (baseOk != 0U) ? lc_get_base() : 0;
     s_lastPulse   = s_zeroRef;
     s_targetPulse = s_zeroRef;
 
@@ -1040,15 +1165,22 @@ static void can_boot_run(void)
             can_report_fault(CANP_F_SELFTEST, CANP_LV_WARN, CANP_SRC_BELT, 1U);
         }
         can_report_event(CANP_EV_CAL_DONE, 0U, lc_get_check()->valid_cnt);
-        s_zeroRef = lc_get_base();         /* 重试回零过, 刷新 0 点坐标 */
-        /* 标定完回 0 位: 先快速相对回退, 没到位再用限位慢速确认一次 */
-        if (can_move_wait(s_zeroRef, LC_RETURN_RPM, LC_SCAN_ACC) == 0U) {
-            if (motor_limit_home() != 0U) {
-                (void)lc_set_base();
-                s_zeroRef = lc_get_base();
-                s_lastPulse = s_zeroRef;
-            }
+
+        /* 标定完回 0 位: 直接用限位慢速回零(1400mm @64mm/s 约 22 秒, 必定成功)。
+         * 原来先试"快速相对回退", 一旦位置读不到就会失败, 再落到限位回零,
+         * 最坏要 15+30+30 = 75 秒, 外面看起来就是"标定完了却一分多钟没反应"。
+         * 现在改成确定性的一条路径, 节奏稳定。
+         */
+        s_state = CANP_ST_HOMING;
+        if (motor_limit_home() != 0U) {
+            (void)lc_set_base();
+            s_zeroRef   = lc_get_base();
+            s_lastPulse = s_zeroRef;
         }
+        /* ★ 标定结束后把串口和驱动软复位一次:
+         * 标定期间高频查询位置, 之后读位置会全部失败(只有断电重启才恢复),
+         * 这里主动恢复, 不用断电。 */
+        can_serial_recover();
     } else {
         phase = CANP_PH_READ_DATA;
     }
@@ -1103,7 +1235,17 @@ static void can_exec_task(void)
             s_targetPulse = pulse;
             d = can_move_to(pulse, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
             if (d == INT32_MIN) {
-                /* 位置读不到: 不瞎走, 直接报位置异常并中止本包(参数 1 = 位置读取失败) */
+                /* 读位置失败时先多试几轮再判死:
+                 * 实测约 13% 的运动因为一次偶发读失败就被中止,
+                 * 而下一包立刻又正常, 说明只是串口抖动, 不该一枪打死。
+                 */
+                if (s_readRetry < CAN_READ_RETRY_MAX) {
+                    s_readRetry++;
+                    DDL_DelayMS(30U);
+                    break;                          /* 留在 EXEC_NEXT, 下一轮再试 */
+                }
+                s_readRetry = 0U;
+                /* 多轮都读不到: 不瞎走, 报位置异常并中止本包(参数 1 = 位置读取失败) */
                 s_fault   = CANP_F_POSITION;
                 s_faultLv = CANP_LV_ERR;
                 can_report_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR, 1U);
@@ -1111,6 +1253,7 @@ static void can_exec_task(void)
                 s_exec    = EXEC_DONE;
                 break;
             }
+            s_readRetry = 0U;
             s_moveMinMs = can_move_min_ms(d);
             s_moveT0 = now;
             s_state  = CANP_ST_MOVING;
@@ -1406,4 +1549,7 @@ void can_init(void)
     s_dbgDis   = 0U;
     s_dbgDlc   = 0U;
     s_dbgLastId = 0U;
+
+    /* 注册阻塞期服务: motor.c 回零 / lc.c 扫描 的等待循环里会调 app_service() */
+    app_set_service(can_idle);
 }
