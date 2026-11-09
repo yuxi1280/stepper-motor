@@ -370,15 +370,7 @@ uint16_t motor_rx_available(void)
     return uart_rx_count(MOTOR_UART_IDX);
 }
 
-/* 定长收帧(滑动重同步 + 字节预算):
- * 期望 buf[0]=地址, buf[1]=功能码, buf[len-1]=校验。
- *
- * 原来的写法是"收满 len 字节, 校验不对就整帧丢弃", 残留字节会污染下一次读取;
- * 一旦错位, 后面几十次读位置全部失败(表现为 0x0A 且 PARAM=0x7FFF 连成一片)。
- * 现在改成滑动窗口: 不在帧头就丢 1 字节继续找, 校验不过也只退 1 字节。
- *
- * 同时必须保留"字节预算": 线路上一直有杂波时不能无限循环, 否则主循环会卡死。
- */
+
 static uint8_t motor_read_frame(uint8_t code, uint8_t *buf, uint8_t len, uint32_t timeout_ms)
 {
     uint32_t idle   = 0U;

@@ -118,6 +118,7 @@ static uint8_t  s_moveRetry;              /* 本次运动已重发次数(最多 
 static uint8_t  s_readRetry;              /* 读位置失败后的重试轮数 */
 static uint32_t s_moveTmo;                /* 本次运动超时时间(重发后自动延长) */
 static uint32_t s_moveLastAct;            /* 上次"下发/重发"指令的时刻 */
+static uint32_t s_progMs;                 /* 执行器最近一次有实质进展的时刻(看门狗用) */
 
 /* ================= 小工具 ================= */
 static uint8_t can_next_seq(void)
@@ -270,6 +271,7 @@ static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
     s_moveRetry  = 0U;                     /* 本次运动还没重发过 */
     s_moveTmo    = CAN_MOVE_TIMEOUT_MS;
     s_moveLastAct = SysTick_GetTick();     /* 记下发指令的时刻 */
+    s_progMs     = s_moveLastAct;          /* 有新动作下发 = 执行器有进展 */
     g_motor_last_reply = 0U; 
     if (d > 0) {
         motor_move(0, (uint32_t)d, rpm, acc, MOTOR_MODE_REL_CUR, 0U);
@@ -956,6 +958,7 @@ static void can_boot_run(void);
 static void can_handle_fault_clear(uint8_t seq)
 {
     uint8_t r = CANP_CLR_OK;
+    uint8_t oldFault = s_fault;
 
     check_clear_overcurrent();
     motor_clear_alarm();
@@ -979,11 +982,15 @@ static void can_handle_fault_clear(uint8_t seq)
     s_lastFaultCode = 0U;
     s_state         = CANP_ST_IDLE;
     s_lastRxMs      = SysTick_GetTick();
+    s_progMs        = s_lastRxMs;
 
     can_tx_msg(CANP_R_CLR_ACK, seq, &r, 1U);
 
-    /* 清除后重新跑一遍自检/标定 */
-    s_bootDone = 0U;
+
+    if ((lc_ref_valid() == 0U) || (oldFault == CANP_F_SELFTEST) ||
+        (oldFault == CANP_F_HOME_TIMEOUT)) {
+        s_bootDone = 0U;
+    }
 }
 
 static void can_handle_recal(uint8_t seq)
@@ -1169,7 +1176,6 @@ static void can_boot_run(void)
         /* 标定完回 0 位: 直接用限位慢速回零(1400mm @64mm/s 约 22 秒, 必定成功)。
          * 原来先试"快速相对回退", 一旦位置读不到就会失败, 再落到限位回零,
          * 最坏要 15+30+30 = 75 秒, 外面看起来就是"标定完了却一分多钟没反应"。
-         * 现在改成确定性的一条路径, 节奏稳定。
          */
         s_state = CANP_ST_HOMING;
         if (motor_limit_home() != 0U) {
@@ -1197,6 +1203,35 @@ static void can_exec_task(void)
 {
     uint32_t now = SysTick_GetTick();
 
+    /* 执行器看门狗: 万一状态机长时间不推进(实测有卡在 EXEC_WAIT 里两小时、
+     * 既不动作也不报错、队列被上位机灌满只能回"队列满"的情况),
+     * 这里强制收尾: 停电机 -> 报位置异常 -> 回 0x84, 让上位机能继续往下走。
+     */
+    if ((s_exec != EXEC_IDLE) && ((now - s_progMs) > CAN_EXEC_STALL_MS)) {
+        uint8_t wasPark = s_parkMode;
+
+        motor_stop();
+        s_parkMode = 0U;
+        s_state    = CANP_ST_IDLE;
+        s_progMs   = now;
+        s_fault    = CANP_F_POSITION;
+        s_faultLv  = CANP_LV_ERR;
+        can_report_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR, 2U);
+
+        if ((wasPark != 0U) && (s_parkAfter == 0U)) {
+            uint8_t r[3];
+            r[0] = CANP_GZ_FAIL;
+            r[1] = 0U;
+            r[2] = 0U;
+            can_tx_msg(CANP_R_GOZERO, s_parkSeq, r, 3U);
+            s_exec = EXEC_IDLE;
+        } else {
+            s_result = (wasPark != 0U) ? CANP_DONE_PARK_FAIL : CANP_DONE_MOVE_FAIL;
+            s_exec   = EXEC_DONE;
+        }
+        return;
+    }
+
     if (s_exec == EXEC_IDLE) {
         if ((s_qCnt == 0U) || (s_faultLv >= CANP_LV_FATAL)) {
             return;
@@ -1214,6 +1249,7 @@ static void can_exec_task(void)
         s_result  = CANP_DONE_OK;
         s_parkMode = 0U;
         s_exec    = EXEC_NEXT;
+        s_progMs  = now;
     }
 
     switch (s_exec) {
@@ -1235,10 +1271,6 @@ static void can_exec_task(void)
             s_targetPulse = pulse;
             d = can_move_to(pulse, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
             if (d == INT32_MIN) {
-                /* 读位置失败时先多试几轮再判死:
-                 * 实测约 13% 的运动因为一次偶发读失败就被中止,
-                 * 而下一包立刻又正常, 说明只是串口抖动, 不该一枪打死。
-                 */
                 if (s_readRetry < CAN_READ_RETRY_MAX) {
                     s_readRetry++;
                     DDL_DelayMS(30U);
@@ -1280,6 +1312,7 @@ static void can_exec_task(void)
 
             if (arrived != 0U) {
                 s_lastPulse = s_targetPulse;
+                s_progMs    = now;              /* 有进展, 喂看门狗 */
                 if (s_parkMode != 0U) {
                     /* 回到 0 位 */
                     s_parkMode = 0U;
@@ -1300,12 +1333,8 @@ static void can_exec_task(void)
                     s_exec     = EXEC_SETTLE;    /* 再稳定一下才动舵机 */
                 }
             } else if ((s_moveRetry < 2U) &&
+                       ((now - s_moveT0) <= s_moveTmo) &&   /* ★ 硬超时必须优先 */
                        ((now - s_moveLastAct) > (s_moveMinMs + 800U))) {
-                /* 下发后过了"理论时间 + 0.8 秒", 位置几乎没变(容差 3mm):
-                 * 判定驱动没收到这条指令(偶发丢帧), 原样重发, 最多 2 次。
-                 * 注意判据用容差而不是"完全相等": 实际停车常有 1~2mm 偏差,
-                 * 用相等判断会导致该重发的时候不重发。
-                 */
                 int32_t cur = can_read_pos();
 
                 if ((cur != MOTOR_ERR_TIMEOUT) &&
@@ -1324,6 +1353,7 @@ static void can_exec_task(void)
                     s_posChkMs    = now;
                     s_moveLastAct = now;               /* 下次重发至少隔 minMs+0.8s */
                     s_moveTmo    += 6000U;             /* 超时相应延长 */
+                    s_progMs      = now;               /* 喂看门狗 */
                 }
             } else if ((now - s_moveT0) > s_moveTmo) {
                 int32_t act = motor_read_input_pulses(MOTOR_RX_TIMEOUT_MS);
@@ -1332,6 +1362,7 @@ static void can_exec_task(void)
                               : ((act - s_zeroRef) * (int32_t)LC_MM_PER_REV
                                  / (int32_t)MOTOR_PULSES_PER_REV);
 
+                s_progMs = now;
                 motor_stop();
                 s_fault     = CANP_F_POSITION;     /* 同时发 0x89 (L2) */
                 s_faultLv   = CANP_LV_ERR;

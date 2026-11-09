@@ -91,7 +91,7 @@ targets:
         otherCmds: ""
         speed: 4M
         targetName: hc32f460xe
-    uploader: pyOCD
+    uploader: Custom
   Release:
     cppPreprocessAttrs:
       defineList: []
