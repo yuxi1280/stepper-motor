@@ -39,6 +39,7 @@ static uint8_t     s_ref_valid = 0U;
 static uint8_t     s_ref_tried = 0U;
 static int32_t     s_comp[LC_POINT_MAX];
 static lc_check_t  s_check;
+static uint8_t     s_hit_cnt[LC_POINT_MAX];   /* 运行中各凸点命中计数(满 100 上报后清零) */
 
 /* 前置声明: lc_confirmed_count() 在槽位函数之前使用 */
 static uint8_t lc_slot_eval(uint8_t i, int32_t *avg);
@@ -244,11 +245,6 @@ static uint8_t lc_return_zero(void)
     uint32_t t = 0U;
 
     can_report_event(CANP_EV_RETURN0, 0U, 0U);
-
-    /* 回 0 前先"解锁"驱动: 扫描末期如果顶到机械末端, 驱动会锁存堵转保护,
-     * 之后的运动指令全部被忽略 -> 回 0 一直不动 -> 30 秒超时。
-     * 这是"扫描到最远端之后卡很久才回零 / 干脆回不去"的直接原因。
-     */
     motor_clear_alarm();
     DDL_DelayMS(20U);
     motor_enable(1);
@@ -334,7 +330,6 @@ static uint8_t lc_scan_pass(uint8_t pass)
 
     /* 每轮开始前先把驱动"解锁": 只发 enable 是不够的,
      * 堵转/过流保护一旦锁存, enable 会被忽略 -> 指令发下去电机不动
-     * (表现就是"标定只接收不动作")。
      */
     motor_clear_alarm();
     DDL_DelayMS(20U);
@@ -433,10 +428,7 @@ static void lc_point_store(int32_t pulse, uint8_t ok)
     s_count++;
 }
 
-/* 已确认(>=2 个一致样本)的凸点优先占满 10 个参考位, 不足才用未确认的补。
- * 原实现是"按位置取前 10 个", 一旦多测出几个虚假凸点, 前 10 个里混进
- * 未确认点 -> lc_ref_save() 直接返回 0 -> 每次开机器都重新标定。
- */
+/* 已确认(>=2 个一致样本)的凸点优先占满 10 个参考位, 不足才用未确认的补。 */
 static void lc_build_points(void)
 {
     uint8_t conf[LC_SLOT_MAX];
@@ -528,7 +520,7 @@ uint8_t lc_ref_save(void)
     primask = __get_PRIMASK();
     __disable_irq();
     EFM_REG_Unlock();
-    EFM_FWMC_Cmd(ENABLE);                 /* ← 关键：打开 FWMC 写模式 */
+    EFM_FWMC_Cmd(ENABLE);                 /* 打开 FWMC 写模式 */
     ret = EFM_SectorErase(LC_REF_ADDR);
     if (ret == LL_OK) {
         ret = EFM_Program(LC_REF_ADDR, buf, (uint32_t)sizeof(buf));
@@ -549,7 +541,6 @@ uint8_t lc_ref_save(void)
     for (i = 0U; i < LC_POINT_MAX; i++) {
         s_comp[i] = 0;
     }
-    /* 用刚存的参考位算一次判定, 让上位机看到有效的补偿帧(而不是"测量无效") */
     (void)lc_check_ref(&s_ref, &s_check);
     return 1U;
 }
@@ -782,6 +773,93 @@ int32_t lc_get_base(void)
     return s_base_pulse;
 }
 
+/* ================= 凸点位置 / 运行命中统计 ================= */
+/* 当前凸点数: 优先用本次扫描结果, 没扫描过(开机直接读 Flash)就用参考位 */
+uint8_t lc_point_count(void)
+{
+    if (s_count != 0U) {
+        return s_count;
+    }
+    if (lc_ref_ensure() != 0U) {
+        return s_ref.count;
+    }
+    return 0U;
+}
+
+/* idx = 1..N, 位置单位 0.1mm(相对本次回零位) */
+uint8_t lc_point_get(uint8_t idx, int32_t *mm10)
+{
+    int32_t pulse;
+
+    if ((idx == 0U) || (mm10 == NULL)) {
+        return 0U;
+    }
+    if (s_count != 0U) {
+        if (idx > s_count) {
+            return 0U;
+        }
+        *mm10 = s_points[idx - 1U].pos_mm_x100 / 10;   /* 0.01mm -> 0.1mm */
+        return 1U;
+    }
+    if ((lc_ref_ensure() == 0U) || (idx > s_ref.count)) {
+        return 0U;
+    }
+    pulse = s_ref.ref[idx - 1U];
+    *mm10 = lc_pulse_to_mm_x100(pulse) / 10;
+    return 1U;
+}
+
+void lc_hit_clear(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < LC_POINT_MAX; i++) {
+        s_hit_cnt[i] = 0U;
+    }
+}
+
+/* 运行中"同一个点"命中统计:
+ * rel_pulse = 相对本次 0 点的目标脉冲(与 s_ref.ref[] 同一基准),
+ * 找最近的凸点(容差 LC_REF_MATCH_PULSE), 该点计数 +1;
+ * 满 LC_HIT_REPORT_CNT 次就清零并返回 1, idx 给出点序号(1..N)供上报。
+ */
+uint8_t lc_note_hit(int32_t rel_pulse, uint8_t *idx, int32_t *mm10)
+{
+    uint8_t i, best = 0xFFU;
+    int32_t d, best_d = LC_REF_MATCH_PULSE;
+
+    if (lc_ref_ensure() == 0U) {
+        return 0U;                         /* 没有参考位: 没有"同一个点"可比 */
+    }
+    for (i = 0U; i < s_ref.count; i++) {
+        d = rel_pulse - s_ref.ref[i];
+        if (d < 0) {
+            d = -d;
+        }
+        if (d < best_d) {
+            best_d = d;
+            best   = i;
+        }
+    }
+    if (best == 0xFFU) {
+        return 0U;                         /* 不靠近任何凸点, 不计 */
+    }
+    if (s_hit_cnt[best] < 0xFFU) {
+        s_hit_cnt[best]++;
+    }
+    if (s_hit_cnt[best] < LC_HIT_REPORT_CNT) {
+        return 0U;
+    }
+    s_hit_cnt[best] = 0U;                  /* 上报后清零, 防溢出 */
+    if (idx != NULL) {
+        *idx = (uint8_t)(best + 1U);
+    }
+    if (mm10 != NULL) {
+        *mm10 = lc_pulse_to_mm_x100(rel_pulse) / 10;   /* 本次命中位置(0.1mm) */
+    }
+    return 1U;
+}
+
 uint8_t lc_set_base(void)
 {
     if (lc_read_pulse(&s_base_pulse, LC_POS_TIMEOUT_MS, LC_READ_RETRY) == 0U) {
@@ -857,12 +935,6 @@ static lc_result_t lc_scan_all(uint8_t do_home)
     if (lc_read_pulse(&s_base_pulse, LC_POS_TIMEOUT_MS, LC_READ_RETRY) == 0U) {
         return LC_RESULT_POS_ERR;
     }
-    /* 必须从回零位附近开始扫描!
-     * lc_scan_pass() 下发的是"相对当前位置 +1400mm", 如果上一轮扫完停在 1400,
-     * 再扫一次就会从 1400 一路冲到 2800, 撞坏机械。这里直接拦掉。
-     * 判据用"与刚回零时的读数之差", 而不是和绝对 0 比:
-     * 0x32 的读数在回零后不一定正好为 0。
-     */
     {
         int32_t d = s_base_pulse - s_zero_pulse;
         if (d < 0) {
@@ -894,8 +966,8 @@ static lc_result_t lc_scan_all(uint8_t do_home)
             res = LC_RESULT_TIMEOUT;
             break;
         }
-        /* 确认点数达到 LC_MIN_VALID(7) 即可收工。
-         * 原要求 10 个全中, 只要漏检一个凸点就永远标定不成功, 也就永远存不进 Flash。
+        /* 确认点数达到 LC_MIN_VALID(10) 才算完: 现在 10 个凸点都能稳定检出,
+         * 要求全部确认, 少一个就继续下一轮(最多 LC_PASS_MAX 轮)。
          */
         if (lc_confirmed_count() >= LC_MIN_VALID) {
             res = LC_RESULT_ALL;
@@ -910,6 +982,7 @@ lc_result_t lc_scan_run(uint8_t do_home)
 {
     uint8_t i;
 
+    lc_hit_clear();                        /* 重新标定: 点位可能变化, 命中计数归零 */
     s_slot_cnt   = 0U;
     s_count      = 0U;
     s_base_pulse = 0;

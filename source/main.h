@@ -14,8 +14,8 @@
  * ========================================================================== */
 typedef void (*app_service_fn_t)(void);
 
-void app_set_service(app_service_fn_t fn);   /* 注册服务函数(只能注册一个) */
-void app_service(void);                      /* 调用已注册的服务函数(没注册则什么都不做) */
+void app_set_service(app_service_fn_t fn);   
+void app_service(void);                     
 
 #endif /* __MAIN_H__ */
 

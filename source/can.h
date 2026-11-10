@@ -74,6 +74,8 @@ void can_tx_msg(uint8_t cmd, uint8_t seq, const uint8_t *p, uint8_t len);
 
 /* ---- 主动上报 ---- */
 void can_report_comp(void);                                    /* 0x8A 补偿量 */
+void can_report_points(void);                                  /* 0x8C 全部凸点位置(标定完/开机) */
+void can_report_point_stat(uint8_t idx, int32_t mm10);         /* 0x8C 单点累计满 N 次 */
 void can_report_event(uint8_t ev, uint8_t res, uint8_t detail);/* 0x88 自检事件 */
 void can_report_fault(uint8_t code, uint8_t lv, uint8_t src, uint16_t param); /* 0x89 */
 

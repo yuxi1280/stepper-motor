@@ -59,7 +59,12 @@
 #define CANP_R_FAULT            (0x89U)       /* 故障上报(主动) */
 #define CANP_R_COMP             (0x8AU)       /* 补偿量上报(主动) */
 #define CANP_R_GOZERO           (0x8BU)       /* 去 0 点位应答 */
+#define CANP_R_POINT            (0x8CU)       /* 凸点位置/运行统计上报(主动) */
 #define CANP_R_DEBUG            (0x8FU)       /* 调试信息应答 */
+
+/* 0x8C 子类型 SUB */
+#define CANP_PT_CAL             (0x01U)       /* 标定完成: 全部凸点位置 [SUB][N][pos x N] */
+#define CANP_PT_STAT            (0x02U)       /* 单点满 N 次: [SUB][IDX][pos][cnt] */
 
 /* ================= 状态 ================= */
 #define CANP_ST_IDLE            (0x00U)

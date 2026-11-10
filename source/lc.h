@@ -45,7 +45,7 @@
 #define LC_EDGE_DEBOUNCE_MS     (3U)
 #define LC_POS_CHECK_MS         (300U)
 #define LC_POS_TIMEOUT_MS       (50U)
-#define LC_POS_TIMEOUT_FAST_MS  (20U)     /* 原来 5ms 太紧, 凸点边沿经常读不到位置 */
+#define LC_POS_TIMEOUT_FAST_MS  (20U)     
 #define LC_READ_RETRY           (3U)
 
 /* ---- 参考位 / 三层判断 ---- */
@@ -53,7 +53,7 @@
 #define LC_REF_MAGIC            (0x4C435231UL)   /* "LCR1" */
 #define LC_REF_VERSION          (1U)
 #define LC_REF_MATCH_PULSE      (3000)           /* 45mm: 跨次匹配容差 */
-#define LC_MIN_VALID            (7U)             /* 有效点少于 7 个不补偿 */
+#define LC_MIN_VALID            (10U)            /* 有效点少于 10 个不补偿(必须 10 点全部确认) */
 #define LC_A_WARN_PULSE         (33)             /* 0.5mm */
 #define LC_A_ALARM_PULSE        (133)            /* 2mm */
 #define LC_B_WARN_PPM           (500)            /* 0.05% */
@@ -101,6 +101,18 @@ uint8_t     lc_ref_valid(void);             /* 1=已有参考位 */
 const lc_check_t *lc_get_check(void);       /* 上次检查结果 */
 int32_t     lc_get_target(uint8_t idx);     /* 第 idx 点目标脉冲 = R + C */
 int32_t     lc_comp_at(int32_t ref_pulse);  /* 任意参考位置的补偿量(线性插值) */
+
+/* ---- 凸点位置 / 运行命中统计 ----
+ * 运行中每到一个工位(≈某个凸点)就把该点计数 +1, 累计到 LC_HIT_REPORT_CNT
+ * 次上报一次该点位置并清零(防止 uint8 溢出), 用于观察长期的位置漂移。
+ */
+#define LC_HIT_REPORT_CNT   (100U)
+
+uint8_t     lc_point_count(void);                    /* 当前凸点数(标定值或 Flash 参考位) */
+uint8_t     lc_point_get(uint8_t idx, int32_t *mm10);/* idx=1..N, 返回位置(0.1mm) */
+/* 命中统计: 1=本点满次数需上报; idx=点序号(1..N), mm10=本次命中位置(0.1mm) */
+uint8_t     lc_note_hit(int32_t rel_pulse, uint8_t *idx, int32_t *mm10);
+void        lc_hit_clear(void);                      /* 清全部命中计数 */
 
 #define LC_GOTO_TIMEOUT_MS      (30000U)
 

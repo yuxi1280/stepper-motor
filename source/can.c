@@ -258,9 +258,6 @@ static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
 
     cur = can_read_pos();
     if (cur == MOTOR_ERR_TIMEOUT) {
-        /* 读不到位置就绝不发指令: 拿旧值硬算, 方向和距离都可能错
-         * (表现为往反方向跑 / 撞极限 / 15 秒超时)。返回 INT32_MIN 让调用方马上报错。
-         */
         return INT32_MIN;
     }
     d = target - cur;
@@ -284,8 +281,6 @@ static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
 }
 
 /* 到位判定: 用"相对出发位置实际走了多少"和"该走多少"比。
- * 这样即使 0x32 的坐标原点被驱动内部清零挪动过, 也不受影响;
- * 电机没动(实际位移≈0)时也不会误判为到位。
  */
 static uint8_t can_moved_ok(void)
 {
@@ -394,14 +389,16 @@ static void can_start_park(uint8_t after_task)
     uint8_t i;
 
     s_targetPulse = s_zeroRef;             /* 0 点 = 回零时记下的读数, 不假设它是 0 */
-
-    /* 读位置失败时多试几轮: 偶发的一次抖动不该让整包任务回不了 0 */
     for (i = 0U; i <= CAN_READ_RETRY_MAX; i++) {
         d = can_move_to(s_zeroRef, POS_RPM, POS_ACC);   /* 相对运动, 方向按差值算 */
         if (d != INT32_MIN) {
             break;
         }
-        DDL_DelayMS(30U);
+        if (i == 0U) {
+            can_serial_recover();
+        } else {
+            DDL_DelayMS(30U);
+        }
     }
 
     if (d == INT32_MIN) {
@@ -563,6 +560,53 @@ void can_report_comp(void)
         can_report_fault(CANP_F_BELT_DEV, CANP_LV_WARN, CANP_SRC_BELT,
                          (uint16_t)((b > 65535) ? 65535 : b));
     }
+}
+
+/* 0x8C SUB=1: 凸点位置记录完之后(标定完成 / 开机读 Flash)上报全部点位.
+ * 格式: [SUB][N][pos1_H][pos1_L]...[posN_H][posN_L]
+ *       pos = int16, 单位 0.1mm, 相对本次回零位, 负数补码
+ */
+void can_report_points(void)
+{
+    uint8_t d[2U + (LC_POINT_MAX * 2U)];
+    uint8_t n = lc_point_count();
+    uint8_t i;
+    int32_t mm10;
+
+    if (n > LC_POINT_MAX) {
+        n = LC_POINT_MAX;
+    }
+    d[0] = CANP_PT_CAL;
+    d[1] = n;
+    for (i = 0U; i < n; i++) {
+        if (lc_point_get((uint8_t)(i + 1U), &mm10) == 0U) {
+            mm10 = 0;
+        }
+        if (mm10 > 32767)  { mm10 = 32767; }
+        if (mm10 < -32768) { mm10 = -32768; }
+        can_put_u16(&d[2U + (i * 2U)], (uint16_t)(int16_t)mm10);
+    }
+    can_tx_msg(CANP_R_POINT, can_next_seq(), d, (uint8_t)(2U + (n * 2U)));
+}
+
+/* 0x8C SUB=2: 某个凸点累计命中满 LC_HIT_REPORT_CNT 次, 报一次本次位置(随后 lc 侧已清零).
+ * 格式: [SUB][IDX][pos_H][pos_L][CNT]
+ */
+void can_report_point_stat(uint8_t idx, int32_t mm10)
+{
+    uint8_t d[5];
+
+    if (idx == 0U) {
+        return;                            /* 点序号非法(没有匹配到凸点) */
+    }
+    if (mm10 > 32767)  { mm10 = 32767; }
+    if (mm10 < -32768) { mm10 = -32768; }
+
+    d[0] = CANP_PT_STAT;
+    d[1] = idx;
+    can_put_u16(&d[2], (uint16_t)(int16_t)mm10);
+    d[4] = (uint8_t)LC_HIT_REPORT_CNT;
+    can_tx_msg(CANP_R_POINT, can_next_seq(), d, 5U);
 }
 
 void can_report_event(uint8_t ev, uint8_t res, uint8_t detail)
@@ -985,7 +1029,7 @@ static void can_handle_fault_clear(uint8_t seq)
     s_progMs        = s_lastRxMs;
 
     can_tx_msg(CANP_R_CLR_ACK, seq, &r, 1U);
-
+    can_serial_recover();
 
     if ((lc_ref_valid() == 0U) || (oldFault == CANP_F_SELFTEST) ||
         (oldFault == CANP_F_HOME_TIMEOUT)) {
@@ -1039,6 +1083,7 @@ static void can_handle_recal(uint8_t seq)
     d[1] = 0U;
     can_tx_msg(CANP_R_RECAL, seq, d, 2U);
     can_report_comp();
+    can_report_points();                   /* 重标定完: 上报新的凸点位置 */
 }
 
 static void can_dispatch(uint8_t cmd, uint8_t seq, const uint8_t *d, uint8_t len)
@@ -1196,6 +1241,7 @@ static void can_boot_run(void)
     s_lastSlot = 0U;
     can_report_event(CANP_EV_SELF_DONE, 0U, phase);
     can_report_comp();
+    can_report_points();                   /* 凸点位置记录完: 上报全部点位 */
 }
 
 /* ================= 任务执行 ================= */
@@ -1313,6 +1359,18 @@ static void can_exec_task(void)
             if (arrived != 0U) {
                 s_lastPulse = s_targetPulse;
                 s_progMs    = now;              /* 有进展, 喂看门狗 */
+
+                /* 工位到位(不含回 0): 统计"同一个凸点"被命中了几次,
+                 * 满 LC_HIT_REPORT_CNT 次上报一次该点位置, 计数已在 lc 侧清零。
+                 */
+                if (s_parkMode == 0U) {
+                    uint8_t pt = 0U;
+                    int32_t mm10 = 0;
+                    if (lc_note_hit(s_targetPulse - s_zeroRef, &pt, &mm10) != 0U) {
+                        can_report_point_stat(pt, mm10);
+                    }
+                }
+
                 if (s_parkMode != 0U) {
                     /* 回到 0 位 */
                     s_parkMode = 0U;

@@ -7,12 +7,20 @@ static uart_t      g_uart0;
 
 /* ==================== 通用框架 ==================== */
 
+#define UART_TX_WAIT_MS     (50U)
+
 /* 只入发送缓冲, 不立即启动发送 */
 static bool buf_write_1B_no_tx(const uart_t *u, char c)
 {
     uint32_t tail = BUF_NEXT(u->t_buf->tail, u->t_buf->dat);
+    uint32_t wait = 0U;
+
     while (u->t_buf->head == tail) {
         u->uart_suspend_handle();
+        if (++wait > UART_TX_WAIT_MS) {
+            return false;                  /* 通道卡死: 丢弃本字节 */
+        }
+        DDL_DelayMS(1U);
     }
     u->t_buf->dat[u->t_buf->tail] = c;
     u->t_buf->tail = tail;
@@ -23,8 +31,14 @@ static bool buf_write_1B_no_tx(const uart_t *u, char c)
 static bool buf_write_char(const uart_t *u, char c)
 {
     uint32_t tail = BUF_NEXT(u->t_buf->tail, u->t_buf->dat);
+    uint32_t wait = 0U;
+
     while (u->t_buf->head == tail) {
         u->uart_suspend_handle();
+        if (++wait > UART_TX_WAIT_MS) {
+            return false;                  /* 通道卡死: 丢弃本字节 */
+        }
+        DDL_DelayMS(1U);
     }
     u->t_buf->dat[u->t_buf->tail] = c;
     u->t_buf->tail = tail;
@@ -241,6 +255,14 @@ uint16_t uart_recv(uart_idx_t idx, uint8_t *dst, uint16_t len)
 
 void uart_driver_init(void)
 {
+    USART_FuncCmd(CM_USART1, USART_INT_TX_EMPTY, DISABLE);
+    USART_FuncCmd(CM_USART1, USART_INT_RX, DISABLE);
+
+    g_uart0_tx_buf.head = 0U;
+    g_uart0_tx_buf.tail = 0U;
+    g_uart0_rx_buf.head = 0U;
+    g_uart0_rx_buf.tail = 0U;
+
     g_uart0.h_usart = CM_USART1;
     g_uart0.baud     = 115200U;
     g_uart0.bit      = 8U;

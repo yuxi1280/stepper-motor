@@ -419,8 +419,7 @@ static uint8_t motor_read_frame(uint8_t code, uint8_t *buf, uint8_t len, uint32_
 /* 发查询 + 收应答; 成功返回帧长(数据在 buf[2..len-2]), 失败返回 0
  *
  * 自愈: 连续 MOTOR_RX_FAIL_REINIT 次收不到应答时, 判定 MCU 的 USART1 接收端锁死
- * (现象: 电机能收指令能动作, 但上位机一个字节都收不到, 只有断电重启才恢复),
- * 这里主动重新初始化一次串口, 然后立刻重试本次查询。
+ * 主动重新初始化一次串口, 然后立刻重试本次查询。
  */
 static uint8_t motor_query(uint8_t code, uint8_t *buf, uint32_t timeout_ms)
 {
