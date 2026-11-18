@@ -194,6 +194,27 @@ void app_service(void)
     }
 }
 
+/* ================= 校准中止标志 =================
+ * 急停/停止时置位, 长阻塞循环(回零/扫描)里检查到就提前退出,
+ * 保证急停是"真正的停止", 而不是等一个动作跑完。
+ */
+static volatile uint8_t s_abortCalib = 0U;
+
+void app_abort_calib(void)
+{
+    s_abortCalib = 1U;
+}
+
+void app_abort_clear(void)
+{
+    s_abortCalib = 0U;
+}
+
+uint8_t app_abort_active(void)
+{
+    return s_abortCalib;
+}
+
 int main(void)
 {
     /* Register write unprotected for some required peripherals. */

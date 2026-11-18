@@ -30,6 +30,12 @@
 /* 调试上报: 1=每 2s 主动发一帧 0x8F, 0=关闭(需要时手动发 0x0F 查询一次) */
 #define CAN_DEBUG_REPORT        (0U)
 
+/* 主动校准周期(上电起算的运行时长, 掉电清零)。
+ * 正式 24h = 24*60*60*1000, 测试用 20min。
+ * 到点且队列空闲时自动触发一次校准(慢速扫描对比参考位 -> 更新并持久化补偿)。
+ */
+#define CAN_CALIB_PERIOD_MS     (20UL * 60UL * 1000UL)
+
 /* 单工位运动超时(全行程 1.5m @600rpm 约 3s, 留足余量) */
 #define CAN_MOVE_TIMEOUT_MS     (15000U)
 
@@ -75,7 +81,6 @@ void can_tx_msg(uint8_t cmd, uint8_t seq, const uint8_t *p, uint8_t len);
 /* ---- 主动上报 ---- */
 void can_report_comp(void);                                    /* 0x8A 补偿量 */
 void can_report_points(void);                                  /* 0x8C 全部凸点位置(标定完/开机) */
-void can_report_point_stat(uint8_t idx, int32_t mm10);         /* 0x8C 单点累计满 N 次 */
 void can_report_event(uint8_t ev, uint8_t res, uint8_t detail);/* 0x88 自检事件 */
 void can_report_fault(uint8_t code, uint8_t lv, uint8_t src, uint16_t param); /* 0x89 */
 

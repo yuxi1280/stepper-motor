@@ -21,7 +21,7 @@
 /* ---- 标尺/运动 ---- */
 #define LC_POINT_MAX            (10U)
 #define LC_TARGET_MM            (1400U)
-#define LC_SCAN_RPM             (80U)
+#define LC_SCAN_RPM             (40U)      /* 慢速扫描, 提升凸点采样精度 */
 #define LC_SCAN_ACC             (100U)
 #define LC_MM_PER_REV           (PULLEY_MM_PER_REV)
 
@@ -43,7 +43,7 @@
 /* ---- 时序 ---- */
 #define LC_POLL_MS              (1U)
 #define LC_EDGE_DEBOUNCE_MS     (3U)
-#define LC_POS_CHECK_MS         (300U)
+#define LC_POS_CHECK_MS         (1000U)   /* 兜底核对: 降到 1s, 平时靠 9F 到位帧判终点 */
 #define LC_POS_TIMEOUT_MS       (50U)
 #define LC_POS_TIMEOUT_FAST_MS  (20U)     
 #define LC_READ_RETRY           (3U)
@@ -51,7 +51,7 @@
 /* ---- 参考位 / 三层判断 ---- */
 #define LC_REF_ADDR             (0x0007E000UL)   /* 最后一个 8KB 扇区, 确认程序 < 0x7E000 */
 #define LC_REF_MAGIC            (0x4C435231UL)   /* "LCR1" */
-#define LC_REF_VERSION          (1U)
+#define LC_REF_VERSION          (2U)             /* v2: 增加补偿量/检查结论持久化 */
 #define LC_REF_MATCH_PULSE      (3000)           /* 45mm: 跨次匹配容差 */
 #define LC_MIN_VALID            (10U)            /* 有效点少于 10 个不补偿(必须 10 点全部确认) */
 #define LC_A_WARN_PULSE         (33)             /* 0.5mm */
@@ -102,17 +102,17 @@ const lc_check_t *lc_get_check(void);       /* 上次检查结果 */
 int32_t     lc_get_target(uint8_t idx);     /* 第 idx 点目标脉冲 = R + C */
 int32_t     lc_comp_at(int32_t ref_pulse);  /* 任意参考位置的补偿量(线性插值) */
 
-/* ---- 凸点位置 / 运行命中统计 ----
- * 运行中每到一个工位(≈某个凸点)就把该点计数 +1, 累计到 LC_HIT_REPORT_CNT
- * 次上报一次该点位置并清零(防止 uint8 溢出), 用于观察长期的位置漂移。
- */
-#define LC_HIT_REPORT_CNT   (100U)
-
+/* ---- 凸点位置 ---- */
 uint8_t     lc_point_count(void);                    /* 当前凸点数(标定值或 Flash 参考位) */
 uint8_t     lc_point_get(uint8_t idx, int32_t *mm10);/* idx=1..N, 返回位置(0.1mm) */
-/* 命中统计: 1=本点满次数需上报; idx=点序号(1..N), mm10=本次命中位置(0.1mm) */
-uint8_t     lc_note_hit(int32_t rel_pulse, uint8_t *idx, int32_t *mm10);
-void        lc_hit_clear(void);                      /* 清全部命中计数 */
+
+/* ---- 补偿持久化 ----
+ * 主动校准只更新补偿量, 不覆盖参考位: lc_comp_persist() 把内存里的
+ * s_comp / s_check 连同参考位一起写回 Flash(整扇区), 掉电也不丢。
+ * 急停/校准失败后调 lc_ref_reload() 恢复 Flash 里的旧数据。
+ */
+uint8_t     lc_comp_persist(void);                   /* 写回补偿量+检查结论(不覆盖参考位) */
+uint8_t     lc_ref_reload(void);                     /* 强制重载参考位+补偿(恢复旧数据) */
 
 #define LC_GOTO_TIMEOUT_MS      (30000U)
 

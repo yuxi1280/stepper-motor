@@ -21,6 +21,11 @@ typedef struct {
     uint16_t version;
     uint16_t count;
     int32_t  ref[LC_POINT_MAX];
+    int32_t  comp[LC_POINT_MAX];   /* 每个凸点的补偿量(脉冲), 主动校准持久化 */
+    int32_t  a;                    /* 整体偏移(脉冲) */
+    int32_t  b_ppm;                /* 斜率(ppm) */
+    uint8_t  decision;             /* LC_CHK_xxx 上次检查结论 */
+    uint8_t  reserved[3];
     uint32_t crc32;
 } lc_ref_t;
 
@@ -39,7 +44,6 @@ static uint8_t     s_ref_valid = 0U;
 static uint8_t     s_ref_tried = 0U;
 static int32_t     s_comp[LC_POINT_MAX];
 static lc_check_t  s_check;
-static uint8_t     s_hit_cnt[LC_POINT_MAX];   /* 运行中各凸点命中计数(满 100 上报后清零) */
 
 /* 前置声明: lc_confirmed_count() 在槽位函数之前使用 */
 static uint8_t lc_slot_eval(uint8_t i, int32_t *avg);
@@ -280,6 +284,11 @@ static uint8_t lc_return_zero(void)
 
     while (t < LC_RETURN_TIMEOUT_MS) {
         app_service();                      /* 回零最长 30 秒, 期间照样应答上位机 */
+        if (app_abort_active() != 0U) {     /* 急停: 立刻停下 */
+            motor_stop();
+            can_report_event(CANP_EV_RETURN0, 3U, 0U);
+            return 0U;
+        }
         DDL_DelayMS(20U);
         t += 20U;
 
@@ -317,9 +326,10 @@ static uint8_t lc_return_zero(void)
 
 static uint8_t lc_scan_pass(uint8_t pass)
 {
-    uint32_t t_ms   = 0U;
-    uint32_t chk_ms = 0U;
-    int32_t  raw    = 0;
+    uint32_t t_ms     = 0U;
+    uint32_t chk_ms   = 0U;
+    int32_t  raw      = 0;
+    uint16_t done_ref = 0U;                /* 出发时的 9F 到位计数 */
     uint8_t  last_act;
     uint8_t  act;
 
@@ -336,10 +346,16 @@ static uint8_t lc_scan_pass(uint8_t pass)
     motor_enable(1);
     DDL_DelayMS(50U);
     motor_flush_rx();
+    done_ref = g_motor_done_cnt;           /* 记下出发时的 9F 计数 */
     lc_move_forward(LC_TARGET_PULSE);
 
     for (;;) {
         app_service();                      /* 扫描 20 多秒, 期间照样应答上位机 */
+        if (app_abort_active() != 0U) {     /* 急停: 立刻停下 */
+            motor_stop();
+            motor_stop();
+            return 0U;
+        }
         DDL_DelayMS(LC_POLL_MS);
         t_ms += LC_POLL_MS;
 
@@ -357,6 +373,12 @@ static uint8_t lc_scan_pass(uint8_t pass)
             act = 0U;
         }
         last_act = act;
+
+        /* 扫描结束: 电机 FD 到位会主动发 9F, 计数变化即到达 1400 目标。
+         * 优先用 9F 判终点, 不再高频读位置(下面 1s 核对只作兜底)。 */
+        if (g_motor_done_cnt != done_ref) {
+            break;
+        }
 
         if (t_ms >= LC_PASS_TIMEOUT_MS) {
             motor_stop();
@@ -459,6 +481,8 @@ static void lc_build_points(void)
 /* ================= 参考位(Flash) ================= */
 static uint8_t lc_ref_load(void)
 {
+    uint8_t i;
+
     memcpy(&s_ref, (const void *)LC_REF_ADDR, sizeof(s_ref));
     s_ref_tried = 1U;
     s_ref_valid = 0U;
@@ -476,7 +500,24 @@ static uint8_t lc_ref_load(void)
         return 0U;
     }
     s_ref_valid = 1U;
+
+    /* 恢复补偿量与检查结论(主动校准持久化的, 上电即生效) */
+    for (i = 0U; i < LC_POINT_MAX; i++) {
+        s_comp[i] = s_ref.comp[i];
+    }
+    s_check.a         = s_ref.a;
+    s_check.b_ppm     = s_ref.b_ppm;
+    s_check.decision  = s_ref.decision;
+    s_check.max_r     = 0;
+    s_check.valid_cnt = s_ref.count;
     return 1U;
+}
+
+/* 强制重新加载(忽略缓存标志): 急停/校准失败后恢复 Flash 里的旧数据 */
+uint8_t lc_ref_reload(void)
+{
+    s_ref_tried = 0U;
+    return lc_ref_load();
 }
 
 static uint8_t lc_ref_ensure(void)
@@ -499,6 +540,7 @@ uint8_t lc_ref_save(void)
     if ((s_count < LC_MIN_VALID) || (s_result != LC_RESULT_ALL)) {
         return 0U;
     }
+    memset(&r, 0, sizeof(r));              /* 结构已扩展, 先整体清零 */
     /* lc_build_points() 已把"已确认"的点排在前面, 只存这些 */
     for (i = 0U; (i < s_count) && (i < LC_POINT_MAX); i++) {
         if (s_points[i].ok == 0U) {
@@ -511,10 +553,13 @@ uint8_t lc_ref_save(void)
         return 0U;
     }
 
-    r.magic   = LC_REF_MAGIC;
-    r.version = LC_REF_VERSION;
-    r.count   = n;
-    r.crc32   = lc_crc32((const uint8_t *)&r, (uint32_t)offsetof(lc_ref_t, crc32));
+    r.magic    = LC_REF_MAGIC;
+    r.version  = LC_REF_VERSION;
+    r.count    = n;
+    r.a        = 0;                        /* 新标定: 补偿清零 */
+    r.b_ppm    = 0;
+    r.decision = LC_CHK_OK;
+    r.crc32    = lc_crc32((const uint8_t *)&r, (uint32_t)offsetof(lc_ref_t, crc32));
     memcpy(buf, &r, sizeof(r));
 
     primask = __get_PRIMASK();
@@ -535,14 +580,52 @@ uint8_t lc_ref_save(void)
     }
 
     s_ref_valid = 0U;
-    if (lc_ref_load() == 0U) {
+    return lc_ref_load();                  /* 重载: 恢复(清零后的)补偿与结论 */
+}
+
+/* 主动校准后: 只更新补偿量与检查结论, 不覆盖参考位。
+ * Flash 是整扇区擦写, 所以把参考位原样写回 + 新的补偿量一起落盘。
+ */
+uint8_t lc_comp_persist(void)
+{
+    lc_ref_t r;
+    uint8_t buf[sizeof(lc_ref_t)];
+    uint32_t primask;
+    int32_t ret;
+    uint8_t i;
+
+    if (lc_ref_ensure() == 0U) {
+        return 0U;                         /* 没有参考位, 无补偿可存 */
+    }
+
+    r = s_ref;                             /* 参考位原样保留 */
+    for (i = 0U; i < LC_POINT_MAX; i++) {
+        r.comp[i] = s_comp[i];
+    }
+    r.a        = s_check.a;
+    r.b_ppm    = s_check.b_ppm;
+    r.decision = s_check.decision;
+    r.crc32    = lc_crc32((const uint8_t *)&r, (uint32_t)offsetof(lc_ref_t, crc32));
+    memcpy(buf, &r, sizeof(r));
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    EFM_REG_Unlock();
+    EFM_FWMC_Cmd(ENABLE);
+    ret = EFM_SectorErase(LC_REF_ADDR);
+    if (ret == LL_OK) {
+        ret = EFM_Program(LC_REF_ADDR, buf, (uint32_t)sizeof(buf));
+    }
+    EFM_FWMC_Cmd(DISABLE);
+    EFM_REG_Lock();
+    __set_PRIMASK(primask);
+
+    if (ret != LL_OK) {
         return 0U;
     }
-    for (i = 0U; i < LC_POINT_MAX; i++) {
-        s_comp[i] = 0;
-    }
-    (void)lc_check_ref(&s_ref, &s_check);
-    return 1U;
+
+    s_ref_valid = 0U;
+    return lc_ref_load();
 }
 
 uint8_t lc_ref_clear(void)
@@ -809,57 +892,6 @@ uint8_t lc_point_get(uint8_t idx, int32_t *mm10)
     return 1U;
 }
 
-void lc_hit_clear(void)
-{
-    uint8_t i;
-
-    for (i = 0U; i < LC_POINT_MAX; i++) {
-        s_hit_cnt[i] = 0U;
-    }
-}
-
-/* 运行中"同一个点"命中统计:
- * rel_pulse = 相对本次 0 点的目标脉冲(与 s_ref.ref[] 同一基准),
- * 找最近的凸点(容差 LC_REF_MATCH_PULSE), 该点计数 +1;
- * 满 LC_HIT_REPORT_CNT 次就清零并返回 1, idx 给出点序号(1..N)供上报。
- */
-uint8_t lc_note_hit(int32_t rel_pulse, uint8_t *idx, int32_t *mm10)
-{
-    uint8_t i, best = 0xFFU;
-    int32_t d, best_d = LC_REF_MATCH_PULSE;
-
-    if (lc_ref_ensure() == 0U) {
-        return 0U;                         /* 没有参考位: 没有"同一个点"可比 */
-    }
-    for (i = 0U; i < s_ref.count; i++) {
-        d = rel_pulse - s_ref.ref[i];
-        if (d < 0) {
-            d = -d;
-        }
-        if (d < best_d) {
-            best_d = d;
-            best   = i;
-        }
-    }
-    if (best == 0xFFU) {
-        return 0U;                         /* 不靠近任何凸点, 不计 */
-    }
-    if (s_hit_cnt[best] < 0xFFU) {
-        s_hit_cnt[best]++;
-    }
-    if (s_hit_cnt[best] < LC_HIT_REPORT_CNT) {
-        return 0U;
-    }
-    s_hit_cnt[best] = 0U;                  /* 上报后清零, 防溢出 */
-    if (idx != NULL) {
-        *idx = (uint8_t)(best + 1U);
-    }
-    if (mm10 != NULL) {
-        *mm10 = lc_pulse_to_mm_x100(rel_pulse) / 10;   /* 本次命中位置(0.1mm) */
-    }
-    return 1U;
-}
-
 uint8_t lc_set_base(void)
 {
     if (lc_read_pulse(&s_base_pulse, LC_POS_TIMEOUT_MS, LC_READ_RETRY) == 0U) {
@@ -982,7 +1014,6 @@ lc_result_t lc_scan_run(uint8_t do_home)
 {
     uint8_t i;
 
-    lc_hit_clear();                        /* 重新标定: 点位可能变化, 命中计数归零 */
     s_slot_cnt   = 0U;
     s_count      = 0U;
     s_base_pulse = 0;

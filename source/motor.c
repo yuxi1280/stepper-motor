@@ -222,6 +222,10 @@ static uint8_t motor_limit_home_once(void)
 
     while (motor_limit_active() == 0U) {
         app_service();                 /* 回零最长 30 秒, 期间照样应答上位机 */
+        if (app_abort_active() != 0U) {  /* 急停: 立刻停下 */
+            motor_stop();
+            return 0U;
+        }
         DDL_DelayMS(1);
         if (++tick >= MOTOR_LIMIT_TIMEOUT_MS) {
             motor_stop();

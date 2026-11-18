@@ -70,6 +70,10 @@ static uint8_t s_commLost;
 static uint8_t s_bootDone;
 static uint8_t s_lastFaultCode;
 
+/* 主动校准状态 */
+static uint8_t  s_calibRun;               /* 1=主动校准进行中 */
+static uint32_t s_calibT0;                /* 校准周期计时起点(SysTick tick) */
+
 /* ================= 任务队列 ================= */
 typedef struct {
     uint8_t seq;                          /* 上位机本次任务的 SEQ, 0x84 回显 */
@@ -589,26 +593,6 @@ void can_report_points(void)
     can_tx_msg(CANP_R_POINT, can_next_seq(), d, (uint8_t)(2U + (n * 2U)));
 }
 
-/* 0x8C SUB=2: 某个凸点累计命中满 LC_HIT_REPORT_CNT 次, 报一次本次位置(随后 lc 侧已清零).
- * 格式: [SUB][IDX][pos_H][pos_L][CNT]
- */
-void can_report_point_stat(uint8_t idx, int32_t mm10)
-{
-    uint8_t d[5];
-
-    if (idx == 0U) {
-        return;                            /* 点序号非法(没有匹配到凸点) */
-    }
-    if (mm10 > 32767)  { mm10 = 32767; }
-    if (mm10 < -32768) { mm10 = -32768; }
-
-    d[0] = CANP_PT_STAT;
-    d[1] = idx;
-    can_put_u16(&d[2], (uint16_t)(int16_t)mm10);
-    d[4] = (uint8_t)LC_HIT_REPORT_CNT;
-    can_tx_msg(CANP_R_POINT, can_next_seq(), d, 5U);
-}
-
 void can_report_event(uint8_t ev, uint8_t res, uint8_t detail)
 {
     uint8_t d[3];
@@ -681,6 +665,7 @@ void can_estop(void)
     motor_stop();
     motor_enable(0);                       /* 步进下电(失能松轴) */
     servo_release();                       /* 舵机释放扭力 */
+    app_abort_calib();                     /* 若在校准: 中止校准动作 */
 
     if (s_exec != EXEC_IDLE) {
         uint8_t d[3];
@@ -957,6 +942,7 @@ static void can_handle_stop(uint8_t seq)
 
     motor_stop();
     servo_stop();
+    app_abort_calib();                     /* 若在校准: 中止校准动作 */
 
     d[0] = CANP_DONE_STOPPED;
     d[1] = s_doneCnt;
@@ -1012,6 +998,7 @@ static void can_handle_fault_clear(uint8_t seq)
     /* 强制复位执行状态机: 万一卡在 EXEC_WAIT/SETTLE/SERVO, 先回到 IDLE,
      * 否则清完故障后状态仍然"忙", 后面发什么都进不来。
      */
+    app_abort_calib();                     /* 若在校准: 中止校准动作 */
     motor_stop();
     DDL_DelayMS(20U);
     s_exec     = EXEC_IDLE;
@@ -1055,6 +1042,7 @@ static void can_handle_recal(uint8_t seq)
 
     /* 换皮带: 清参考位/补偿 -> 回零 -> 重新记录凸点 -> 存 Flash */
     s_state = CANP_ST_CALIB;
+    app_abort_clear();                     /* 清除上一次急停残留的中止标志 */
     (void)lc_ref_clear();
     r = lc_scan_run(1U);
     if (r != LC_RESULT_ALL) {
@@ -1086,19 +1074,183 @@ static void can_handle_recal(uint8_t seq)
     can_report_points();                   /* 重标定完: 上报新的凸点位置 */
 }
 
+/* ================= 主动校准 =================
+ * 与 0x07 重标定(换皮带, 覆盖参考位)不同: 校准只"慢速扫描对比参考位",
+ * 算出来的补偿量写 Flash 持久化, 参考位本身不覆盖, 扫描到的凸点只用于对比上报。
+ * 流程: 慢速回零 -> 慢速扫描对比 -> 补偿落盘 -> 慢速回零 -> 上报 0x8C/0x8A。
+ * 校准期间操控类指令回"校准中"; 急停/停止置 app_abort, 阻塞循环立刻退出,
+ * 退出后恢复 Flash 里的旧补偿继续运行。
+ */
+static void can_calib_run(uint8_t seq, uint8_t from_cmd)
+{
+    lc_result_t r;
+    uint8_t d[2];
+
+    /* 1) 声明校准中 + 应答 */
+    s_calibRun = 1U;
+    s_state    = CANP_ST_CALIB;
+    app_abort_clear();
+    can_report_event(CANP_EV_CAL_START, 0U, 0U);
+    if (from_cmd != 0U) {
+        d[0] = CANP_CAL_ACCEPT;
+        d[1] = 0U;
+        can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+    }
+
+    /* 2) 慢速回零(零点也一起重新校准) */
+    s_state = CANP_ST_HOMING;
+    if (motor_limit_home() == 0U) {
+        uint8_t aborted = app_abort_active();
+        (void)lc_ref_reload();             /* 恢复旧补偿 */
+        s_state    = CANP_ST_IDLE;
+        s_calibRun = 0U;
+        if (aborted == 0U) {               /* 非急停: 真回零失败才上报 */
+            can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
+            can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_ERR, CANP_SRC_MOTOR, 0U);
+        }
+        if (from_cmd != 0U) {
+            d[0] = CANP_CAL_FAIL;
+            d[1] = (aborted != 0U) ? 0U : CANP_F_HOME_TIMEOUT;
+            can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        }
+        s_calibT0 = SysTick_GetTick();
+        return;
+    }
+    DDL_DelayMS(200U);
+    motor_flush_rx();
+    if (lc_set_base() != 0U) {
+        s_zeroRef = lc_get_base();         /* 刷新 0 点坐标 */
+    }
+
+    /* 3) 慢速扫描 + 与参考位对比(内部 lc_check_ref + lc_update_comp) */
+    s_state = CANP_ST_CALIB;
+    r = lc_scan_run(0U);
+    if (r != LC_RESULT_ALL) {
+        uint8_t aborted = app_abort_active();
+        (void)lc_ref_reload();             /* 扫描失败/被中止: 恢复旧补偿 */
+        s_state    = CANP_ST_IDLE;
+        s_calibRun = 0U;
+        if (aborted == 0U) {               /* 非急停: 真扫描失败才上报 */
+            can_report_event(CANP_EV_SELF_ABORT, CANP_F_SELFTEST, (uint8_t)r);
+        }
+        if (from_cmd != 0U) {
+            d[0] = CANP_CAL_FAIL;
+            d[1] = (aborted != 0U) ? 0U : CANP_F_SELFTEST;
+            can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        }
+        s_calibT0 = SysTick_GetTick();
+        return;
+    }
+
+    /* 4) 补偿量落盘(参考位不变) */
+    if (lc_comp_persist() == 0U) {
+        can_report_fault(CANP_F_SELFTEST, CANP_LV_WARN, CANP_SRC_BELT, 1U);
+    }
+
+    /* 5) 慢速回零(校准结束回到 0 点) */
+    s_state = CANP_ST_HOMING;
+    if (motor_limit_home() != 0U) {
+        (void)lc_set_base();
+        s_zeroRef = lc_get_base();
+    }
+    s_lastPulse = s_zeroRef;
+    s_lastSlot  = 0U;
+    can_serial_recover();                  /* 校准后软复位串口/驱动, 防止读位置全失败 */
+
+    /* 6) 上报: 扫描到的凸点只作对比, 补偿量用新值 */
+    s_state    = CANP_ST_IDLE;
+    s_calibRun = 0U;
+    can_report_event(CANP_EV_CAL_DONE, 0U, lc_get_check()->valid_cnt);
+    can_report_points();
+    can_report_comp();
+    if (from_cmd != 0U) {
+        d[0] = CANP_CAL_DONE;
+        d[1] = 0U;
+        can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+    }
+
+    s_calibT0 = SysTick_GetTick();         /* 重置周期计时 */
+}
+
+/* 0x0A 主动校准指令处理 */
+static void can_handle_calib(uint8_t seq)
+{
+    uint8_t d[2];
+
+    if (s_faultLv >= CANP_LV_FATAL) {
+        d[0] = CANP_CAL_FAIL;
+        d[1] = CANP_F_PARAM;
+        can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        return;
+    }
+    if (s_calibRun != 0U) {
+        d[0] = CANP_CAL_FAIL;              /* 已在校准中 */
+        d[1] = CANP_F_PARAM;
+        can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        return;
+    }
+    if (s_exec != EXEC_IDLE) {
+        d[0] = CANP_CAL_FAIL;              /* 有任务在执行, 拒绝 */
+        d[1] = CANP_F_PARAM;
+        can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        return;
+    }
+
+    can_calib_run(seq, 1U);
+}
+
 static void can_dispatch(uint8_t cmd, uint8_t seq, const uint8_t *d, uint8_t len)
 {
     s_dbgDis++;
 
-    /* 只在"自检/回零/标定"这三种独占电机的长动作期间做指令隔离,
-     * 避免 03/07/09 和正在跑的动作抢电机。
-     * 04(停止) 和 05(清故障) 永远放行 —— 卡住时唯一的自救手段。
-     *
-     * 关键: 被拒绝的指令一律回一个"拒绝"应答, 绝不静默丢弃,
-     * 否则上位机会以为设备死了(之前就是这样: 标定期间发 09 毫无反应)。
+    /* 主动校准期间: 操控类指令回"校准中", 心跳/查询/调试正常回,
+     * 04(停止)/05(清故障) 永远放行 —— 急停是保护的底线。
      */
-    if ((s_state == CANP_ST_SELFCHECK) || (s_state == CANP_ST_HOMING) ||
-        (s_state == CANP_ST_CALIB)) {
+    if (s_calibRun != 0U) {
+        if (cmd == CANP_C_TASK) {
+            uint8_t r[3];
+            r[0] = CANP_ACK_CALIBRATING;       /* 校准中: 任务拒收 */
+            r[1] = 0U;
+            r[2] = 0U;
+            can_tx_msg(CANP_R_TASK_ACK, seq, r, 3U);
+            return;
+        }
+        if (cmd == CANP_C_GOZERO) {
+            uint8_t r[3];
+            r[0] = CANP_GZ_CALIBRATING;        /* 校准中: 拒绝去 0 */
+            r[1] = 0U;
+            r[2] = 0U;
+            can_tx_msg(CANP_R_GOZERO, seq, r, 3U);
+            return;
+        }
+        if (cmd == CANP_C_RECAL) {
+            uint8_t r[2];
+            r[0] = CANP_RECAL_CALIBRATING;     /* 校准中: 拒绝重标定 */
+            r[1] = CANP_F_PARAM;
+            can_tx_msg(CANP_R_RECAL, seq, r, 2U);
+            return;
+        }
+        if (cmd == CANP_C_CALIB) {
+            uint8_t r[2];
+            r[0] = CANP_CAL_FAIL;              /* 已在校准中 */
+            r[1] = CANP_F_PARAM;
+            can_tx_msg(CANP_R_CALIB, seq, r, 2U);
+            return;
+        }
+        if ((cmd != CANP_C_PING) && (cmd != CANP_C_INFO) && (cmd != CANP_C_STATUS) &&
+            (cmd != CANP_C_DEBUG) && (cmd != CANP_C_COMP_GET) &&
+            (cmd != CANP_C_STOP) && (cmd != CANP_C_FAULT_CLR)) {
+            return;
+        }
+    }
+
+    /* 开机自检/回零/标定(非主动校准)这三种独占电机的长动作期间做指令隔离,
+     * 避免 03/07/09 和正在跑的动作抢电机。
+     * 关键: 被拒绝的指令一律回一个"拒绝"应答, 绝不静默丢弃。
+     */
+    if ((s_calibRun == 0U) &&
+        ((s_state == CANP_ST_SELFCHECK) || (s_state == CANP_ST_HOMING) ||
+         (s_state == CANP_ST_CALIB))) {
         if (cmd == CANP_C_TASK) {
             uint8_t r[3];
             r[0] = CANP_ACK_PARAM;             /* 自检中: 任务拒收 */
@@ -1145,6 +1297,7 @@ static void can_dispatch(uint8_t cmd, uint8_t seq, const uint8_t *d, uint8_t len
         case CANP_C_STATUS:   can_reply_status(seq);             break;
         case CANP_C_RECAL:    can_handle_recal(seq);             break;
         case CANP_C_GOZERO:   can_handle_goto_zero(seq);         break;
+        case CANP_C_CALIB:    can_handle_calib(seq);             break;
         case CANP_C_COMP_GET: can_report_comp();                 break;
         default:                                                 break;
     }
@@ -1157,6 +1310,7 @@ static void can_boot_run(void)
     uint8_t     phase;
     uint8_t     baseOk = 1U;               /* 0=回零后读不到位置, 已用 0 兜底 */
 
+    app_abort_clear();                     /* 清除上一次急停残留的中止标志 */
     can_report_event(CANP_EV_SELF_START, 0U, 0U);
 
     /* 1) 回零 */
@@ -1218,9 +1372,9 @@ static void can_boot_run(void)
         }
         can_report_event(CANP_EV_CAL_DONE, 0U, lc_get_check()->valid_cnt);
 
-        /* 标定完回 0 位: 直接用限位慢速回零(1400mm @64mm/s 约 22 秒, 必定成功)。
-         * 原来先试"快速相对回退", 一旦位置读不到就会失败, 再落到限位回零,
-         * 最坏要 15+30+30 = 75 秒, 外面看起来就是"标定完了却一分多钟没反应"。
+        /* 标定完回 0 位: 直接用限位慢速回零(1400mm @40RPM=32mm/s 约 44 秒)。
+         * 注意回零超时 MOTOR_LIMIT_TIMEOUT_MS 必须 > 44s, 否则中途超时停在远端,
+         * 后面读位置失败 -> 去 0 也失败, 表现为"卡在最远端不动"。
          */
         s_state = CANP_ST_HOMING;
         if (motor_limit_home() != 0U) {
@@ -1359,17 +1513,6 @@ static void can_exec_task(void)
             if (arrived != 0U) {
                 s_lastPulse = s_targetPulse;
                 s_progMs    = now;              /* 有进展, 喂看门狗 */
-
-                /* 工位到位(不含回 0): 统计"同一个凸点"被命中了几次,
-                 * 满 LC_HIT_REPORT_CNT 次上报一次该点位置, 计数已在 lc 侧清零。
-                 */
-                if (s_parkMode == 0U) {
-                    uint8_t pt = 0U;
-                    int32_t mm10 = 0;
-                    if (lc_note_hit(s_targetPulse - s_zeroRef, &pt, &mm10) != 0U) {
-                        can_report_point_stat(pt, mm10);
-                    }
-                }
 
                 if (s_parkMode != 0U) {
                     /* 回到 0 位 */
@@ -1527,6 +1670,15 @@ void can_task(void)
 
     can_check_heartbeat();
 
+    /* 定时主动校准: 到点且完全空闲(无任务/无排队/无故障/非校准)才触发。
+     * 若到点时正在忙, 则等忙完的下一轮自然触发(条件里要求 IDLE)。
+     */
+    if ((s_calibRun == 0U) && (s_exec == EXEC_IDLE) && (s_qCnt == 0U) &&
+        (s_faultLv < CANP_LV_FATAL) && (s_state == CANP_ST_IDLE) &&
+        ((SysTick_GetTick() - s_calibT0) >= CAN_CALIB_PERIOD_MS)) {
+        can_calib_run(0U, 0U);             /* 定时触发: 不回 0x8D, 只发 0x88/0x8A/0x8C */
+    }
+
     if (s_busOff != 0U) {
         /* 总线关闭: 丢空发送缓冲并重新初始化 CAN 控制器(总线上发不出东西, 不报故障) */
         s_busOff = 0U;
@@ -1618,6 +1770,8 @@ void can_init(void)
     s_parkMode    = 0U;
     s_parkAfter   = 0U;
     s_parkSeq     = 0U;
+    s_calibRun    = 0U;
+    s_calibT0     = 0U;                       /* 校准周期从 0 起算 */
 
     can_hw_config();
 

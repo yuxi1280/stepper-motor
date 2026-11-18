@@ -45,6 +45,7 @@
 #define CANP_C_RECAL            (0x07U)       /* 重新标定凸点(换皮带) */
 #define CANP_C_COMP_GET         (0x08U)       /* 读取补偿量 */
 #define CANP_C_GOZERO           (0x09U)       /* 去 0 点位(不重新回零) */
+#define CANP_C_CALIB            (0x0AU)       /* 主动校准(定时/上位机触发, 不覆盖参考位) */
 #define CANP_C_DEBUG            (0x0FU)       /* 调试信息(台架用) */
 
 /* ================= 命令字: 设备 -> 上位机 ================= */
@@ -59,12 +60,12 @@
 #define CANP_R_FAULT            (0x89U)       /* 故障上报(主动) */
 #define CANP_R_COMP             (0x8AU)       /* 补偿量上报(主动) */
 #define CANP_R_GOZERO           (0x8BU)       /* 去 0 点位应答 */
-#define CANP_R_POINT            (0x8CU)       /* 凸点位置/运行统计上报(主动) */
+#define CANP_R_POINT            (0x8CU)       /* 凸点位置上报(主动) */
+#define CANP_R_CALIB            (0x8DU)       /* 主动校准应答/进度 */
 #define CANP_R_DEBUG            (0x8FU)       /* 调试信息应答 */
 
 /* 0x8C 子类型 SUB */
 #define CANP_PT_CAL             (0x01U)       /* 标定完成: 全部凸点位置 [SUB][N][pos x N] */
-#define CANP_PT_STAT            (0x02U)       /* 单点满 N 次: [SUB][IDX][pos][cnt] */
 
 /* ================= 状态 ================= */
 #define CANP_ST_IDLE            (0x00U)
@@ -106,6 +107,7 @@
 #define CANP_ACK_OK             (0x00U)       /* 已接受/已排队 */
 #define CANP_ACK_QUEUE_FULL     (0x01U)       /* 队列已满 */
 #define CANP_ACK_PARAM          (0x02U)       /* 参数非法(也用于故障态拒收) */
+#define CANP_ACK_CALIBRATING    (0x03U)       /* 设备正在主动校准, 拒收 */
 
 /* 0x84 TASK_DONE [RESULT][DONE][SLOT] */
 #define CANP_DONE_OK            (0x00U)
@@ -123,6 +125,7 @@
 #define CANP_GZ_ARRIVED         (0x01U)       /* 已到达 0 点 */
 #define CANP_GZ_FAIL            (0x02U)       /* 未到位/超时 */
 #define CANP_GZ_BUSY            (0x03U)       /* 正在执行任务, 拒绝 */
+#define CANP_GZ_CALIBRATING     (0x04U)       /* 校准中, 拒绝 */
 
 /* 0x85 清除应答 */
 #define CANP_CLR_OK             (0x00U)
@@ -132,6 +135,12 @@
 #define CANP_RECAL_ACCEPT       (0x00U)
 #define CANP_RECAL_DONE         (0x01U)
 #define CANP_RECAL_FAIL         (0x02U)
+#define CANP_RECAL_CALIBRATING  (0x03U)       /* 校准中, 拒绝 */
+
+/* 0x0A 主动校准 -> 0x8D 应答 [STAGE][RESULT] */
+#define CANP_CAL_ACCEPT         (0x00U)       /* 已接受, 开始校准 */
+#define CANP_CAL_DONE           (0x01U)       /* 校准完成 */
+#define CANP_CAL_FAIL           (0x02U)       /* 校准失败(RESULT=故障码) */
 
 /* 0x88 事件 [EVENT][RESULT][DETAIL] */
 #define CANP_EV_SELF_START      (0x01U)
