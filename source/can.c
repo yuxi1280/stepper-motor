@@ -227,13 +227,14 @@ static void can_driver_ready(void)
  * 现象是之后所有读位置都超时, 任务全部 PARAM=1 失败, 只有断电重启才恢复。
  * 这里重新初始化 USART1 并重新使能驱动, 不用断电就能恢复。
  */
-static void can_serial_recover(void)
+uint8_t can_serial_recover(void)
 {
     uint8_t i;
 
     /* 最多试 4 轮: 每轮重置串口 + 解锁驱动, 然后**实际读一次位置来验证**。
      * 标定这种连续长时间动作之后, 应答通道可能卡住,
      * 不验证的话会出现"自检说恢复好了, 实际读位置还是全失败"。
+     * 返回 1=通道已恢复, 0=4 轮都读不到(驱动侧彻底失效, 需断电重启)。
      */
     for (i = 0U; i < 4U; i++) {
         uart_driver_init();                /* 重置 USART1(DeInit + 重新初始化) */
@@ -246,11 +247,12 @@ static void can_serial_recover(void)
 
         if (motor_read_input_pulses(60U) != MOTOR_ERR_TIMEOUT) {
             motor_flush_rx();
-            return;                        /* 读到了: 通道已恢复 */
+            return 1U;                     /* 读到了: 通道已恢复 */
         }
         DDL_DelayMS(100U);
     }
     motor_flush_rx();
+    return 0U;
 }
 
 static int32_t can_move_to(int32_t target, uint16_t rpm, uint8_t acc)
@@ -1060,6 +1062,14 @@ static void can_handle_recal(uint8_t seq)
     if (motor_limit_home() != 0U) {
         (void)lc_set_base();
         s_zeroRef = lc_get_base();         /* 重新回零过, 刷新 0 点坐标 */
+    } else {
+        /* 回零失败: 零点基准失效, 报 L3 故障停机, 等 0x05 重新自检 */
+        can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
+        can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+        d[0] = CANP_RECAL_FAIL;
+        d[1] = CANP_F_HOME_TIMEOUT;
+        can_tx_msg(CANP_R_RECAL, seq, d, 2U);
+        return;
     }
     s_lastPulse = s_zeroRef;
     s_lastSlot = 0U;
@@ -1152,12 +1162,39 @@ static void can_calib_run(uint8_t seq, uint8_t from_cmd)
     if (motor_limit_home() != 0U) {
         (void)lc_set_base();
         s_zeroRef = lc_get_base();
+    } else {
+        /* 回零失败: 零点基准失效, 报 L3 故障停机(拒接任务), 等 0x05 重新自检。
+         * 否则带着陈旧的 s_zeroRef 继续跑, 后续所有绝对定位都会偏移。 */
+        s_calibRun = 0U;
+        can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
+        can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+        if (from_cmd != 0U) {
+            d[0] = CANP_CAL_FAIL;
+            d[1] = CANP_F_HOME_TIMEOUT;
+            can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        }
+        s_calibT0 = SysTick_GetTick();
+        return;
     }
     s_lastPulse = s_zeroRef;
     s_lastSlot  = 0U;
-    can_serial_recover();                  /* 校准后软复位串口/驱动, 防止读位置全失败 */
 
-    /* 6) 上报: 扫描到的凸点只作对比, 补偿量用新值 */
+    /* 6) 串口/驱动恢复验证: 失败说明驱动侧彻底失效, 明确上报并判校准失败 */
+    if (can_serial_recover() == 0U) {
+        s_state    = CANP_ST_IDLE;
+        s_calibRun = 0U;
+        can_report_event(CANP_EV_SELF_ABORT, CANP_F_POSITION, (uint8_t)LC_RESULT_POS_ERR);
+        can_raise_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR, 0x7FFFU);
+        if (from_cmd != 0U) {
+            d[0] = CANP_CAL_FAIL;
+            d[1] = CANP_F_POSITION;
+            can_tx_msg(CANP_R_CALIB, seq, d, 2U);
+        }
+        s_calibT0 = SysTick_GetTick();
+        return;
+    }
+
+    /* 7) 上报: 扫描到的凸点只作对比, 补偿量用新值 */
     s_state    = CANP_ST_IDLE;
     s_calibRun = 0U;
     can_report_event(CANP_EV_CAL_DONE, 0U, lc_get_check()->valid_cnt);
@@ -1274,6 +1311,13 @@ static void can_dispatch(uint8_t cmd, uint8_t seq, const uint8_t *d, uint8_t len
             can_tx_msg(CANP_R_RECAL, seq, r, 2U);
             return;
         }
+        if (cmd == CANP_C_CALIB) {
+            uint8_t r[2];
+            r[0] = CANP_CAL_FAIL;              /* 自检/标定中: 拒绝校准 */
+            r[1] = CANP_F_PARAM;
+            can_tx_msg(CANP_R_CALIB, seq, r, 2U);
+            return;
+        }
         if ((cmd != CANP_C_PING) && (cmd != CANP_C_INFO) && (cmd != CANP_C_STATUS) &&
             (cmd != CANP_C_DEBUG) && (cmd != CANP_C_COMP_GET) &&
             (cmd != CANP_C_STOP) && (cmd != CANP_C_FAULT_CLR)) {
@@ -1372,15 +1416,19 @@ static void can_boot_run(void)
         }
         can_report_event(CANP_EV_CAL_DONE, 0U, lc_get_check()->valid_cnt);
 
-        /* 标定完回 0 位: 直接用限位慢速回零(1400mm @40RPM=32mm/s 约 44 秒)。
-         * 注意回零超时 MOTOR_LIMIT_TIMEOUT_MS 必须 > 44s, 否则中途超时停在远端,
-         * 后面读位置失败 -> 去 0 也失败, 表现为"卡在最远端不动"。
-         */
+        /* 标定完回 0 位: 直接用限位回零(1400mm @80RPM=64mm/s 约 22 秒)。
+         * 注意: 速度不能低于驱动最低速度(实测 40RPM 驱动不动作, 电机根本不动)。 */
+
         s_state = CANP_ST_HOMING;
         if (motor_limit_home() != 0U) {
             (void)lc_set_base();
             s_zeroRef   = lc_get_base();
             s_lastPulse = s_zeroRef;
+        } else {
+            /* 标定后回零失败: 零点基准失效, 报 L3 故障停机, 等 0x05 重新自检 */
+            can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
+            can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+            return;
         }
         /* ★ 标定结束后把串口和驱动软复位一次:
          * 标定期间高频查询位置, 之后读位置会全部失败(只有断电重启才恢复),

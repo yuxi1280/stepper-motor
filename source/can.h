@@ -75,6 +75,10 @@ void can_task(void);                       /* 主循环每轮调用: 收包/调�
  */
 void can_idle(void);
 
+/* 软复位串口(USART1)+解锁驱动, 并读一次位置验证通道是否恢复。
+ * 返回 1=恢复成功 0=4 轮都读不到(驱动侧彻底失效)。 */
+uint8_t can_serial_recover(void);
+
 /* ---- 发送 ---- */
 void can_tx_msg(uint8_t cmd, uint8_t seq, const uint8_t *p, uint8_t len);
 

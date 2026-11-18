@@ -247,6 +247,7 @@ static uint8_t lc_return_zero(void)
 {
     int32_t cur, delta;
     uint32_t t = 0U;
+    uint8_t  fail_cnt = 0U;
 
     can_report_event(CANP_EV_RETURN0, 0U, 0U);
     motor_clear_alarm();
@@ -309,10 +310,18 @@ static uint8_t lc_return_zero(void)
         }
         /* 位置读数: 用 50ms 超时(原来 5ms 太紧, 经常读不到导致一直等) */
         if (lc_read_pulse(&cur, LC_POS_TIMEOUT_MS, 1U) != 0U) {
+            fail_cnt = 0U;
             delta = cur - s_base_pulse;
             if ((delta <= LC_ZERO_TOL_PULSE) && (delta >= -LC_ZERO_TOL_PULSE)) {
                 can_report_event(CANP_EV_RETURN0, 1U, 0U);
                 return 1U;
+            }
+        } else {
+            /* 连续读不到位置: 串口/驱动卡住, 别死等 30s(每轮 50ms 超时会拖到 150s),
+             * 快速放弃, 交给上层 fallback 到撞限位回零。 */
+            if (++fail_cnt >= LC_RETURN_READ_FAIL_MAX) {
+                motor_stop();
+                return 0U;
             }
         }
     }
@@ -380,6 +389,12 @@ static uint8_t lc_scan_pass(uint8_t pass)
             break;
         }
 
+        /* 理论到位时间兜底: 检测到凸点(电机确实在走)且时间到点,
+         * 即使 9F 没采到、读位置也失败, 也按"已到位"收尾, 避免整轮超时。 */
+        if ((s_pass_edges != 0U) && (t_ms >= LC_SCAN_ARRIVE_MS)) {
+            break;
+        }
+
         if (t_ms >= LC_PASS_TIMEOUT_MS) {
             motor_stop();
             motor_stop();
@@ -410,6 +425,11 @@ static uint8_t lc_scan_pass(uint8_t pass)
     motor_stop();
     motor_stop();
     can_report_event(CANP_EV_PASS_DONE, (uint8_t)lc_confirmed_count(), s_pass_edges);
+
+    /* 扫描结束主动软复位串口/驱动: 高频查询后串口可能短暂卡住,
+     * 否则下一轮回 0 时读位置会持续失败(每轮 50ms 超时把 30s 拖成 150s)。 */
+    (void)can_serial_recover();
+
     return 1U;
 }
 

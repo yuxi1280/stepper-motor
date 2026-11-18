@@ -217,8 +217,10 @@ static uint8_t motor_limit_home_once(void)
         return 1U;
     }
 
-    /* 速度模式向左(负方向)匀速逼近限位 */
-    motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);
+    /* FD 位置模式反向走满行程逼近限位(该驱动 F6 速度模式不动作, 改用 FD)。
+     * 撞限位后 MCU 检测 PB4 立即停止, 与 lc_return_zero 的回零方式一致。 */
+    motor_move(1, MOTOR_HOME_TRAVEL_PULSE, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC,
+               MOTOR_MODE_REL_CUR, 0U);
 
     while (motor_limit_active() == 0U) {
         app_service();                 /* 回零最长 30 秒, 期间照样应答上位机 */

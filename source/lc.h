@@ -48,6 +48,17 @@
 #define LC_POS_TIMEOUT_FAST_MS  (20U)     
 #define LC_READ_RETRY           (3U)
 
+/* 回 0 时连续读不到位置这么多次(约 0.7s)就提前放弃,
+ * 交给上层 fallback 到撞限位回零, 避免每轮 50ms 超时把 30s 拖成 150s 卡死。 */
+#define LC_RETURN_READ_FAIL_MAX (10U)
+
+/* 理论到位时间: LC_TARGET_MM @ LC_SCAN_RPM 的最短时间 + 8s 加速余量。
+ * 检测到凸点(电机确实在走)且到点后, 即使读位置失败也按"已到位"收尾,
+ * 避免读位置偶发失败时整轮干等超时、校准失败。
+ */
+#define LC_SCAN_ARRIVE_MS       ((uint32_t)((((uint32_t)LC_TARGET_MM * 60000UL) / \
+                                ((uint32_t)LC_SCAN_RPM * (uint32_t)LC_MM_PER_REV)) + 8000UL))
+
 /* ---- 参考位 / 三层判断 ---- */
 #define LC_REF_ADDR             (0x0007E000UL)   /* 最后一个 8KB 扇区, 确认程序 < 0x7E000 */
 #define LC_REF_MAGIC            (0x4C435231UL)   /* "LCR1" */
