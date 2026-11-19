@@ -328,6 +328,7 @@ void can_idle(void)
     can_rx_process();                      /* 上位机的 PING/状态/调试 都能回 */
     motor_rx_task();                       /* 收驱动的 9F 到位帧 / ACK */
     servo_rx_task();                       /* 收舵机应答 */
+    check_task();                          /* 阻塞期间也保持电流检测(推/校准/回零不过流漏检) */
     s_busy = 0U;
 }
 

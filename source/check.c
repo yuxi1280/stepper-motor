@@ -7,7 +7,8 @@ uint16_t g_check_adc_raw  = 0U;
 uint16_t g_check_current  = 0U;
 uint8_t  g_check_oc       = 0U;
 
-static uint8_t  s_tick = 0U;
+static uint8_t  s_tick   = 0U;
+static uint8_t  s_oc_cnt = 0U;            /* 过流消抖计数 */
 
 
 #if (CHECK_ZERO_CALIB != 0U)
@@ -147,10 +148,15 @@ void check_task(void)
     g_check_current = cur;
 
     if (cur > CHECK_CURRENT_THRESH_MA) {
-        if (g_check_oc == 0U) {
-            g_check_oc = 1U;
-            check_overcurrent_action();
+        /* 连续超阈值 CHECK_OC_DEBOUNCE_CNT 次才判过流, 过滤启动瞬时电流尖峰 */
+        if (++s_oc_cnt >= CHECK_OC_DEBOUNCE_CNT) {
+            if (g_check_oc == 0U) {
+                g_check_oc = 1U;
+                check_overcurrent_action();
+            }
         }
+    } else {
+        s_oc_cnt = 0U;                     /* 电流回落: 清零消抖计数 */
     }
 }
 
@@ -160,7 +166,7 @@ void check_task(void)
 uint16_t check_current_ma(void)          { return g_check_current; }
 uint16_t check_adc_raw(void)             { return g_check_adc_raw; }
 uint8_t  check_is_overcurrent(void)      { return g_check_oc; }
-void     check_clear_overcurrent(void)   { g_check_oc = 0U; }
+void     check_clear_overcurrent(void)   { g_check_oc = 0U; s_oc_cnt = 0U; }
 
 /* ------------------------- 过流动作 ------------------------- */
 __WEAKDEF void check_overcurrent_action(void)

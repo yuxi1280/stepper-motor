@@ -24,6 +24,12 @@
 /* ---- 过流阈值(mA) ---- */
 #define CHECK_CURRENT_THRESH_MA (2500U)
 
+/* ---- 过流消抖 ----
+ * 连续 N 次采样都超阈值才判过流(采样约 10ms 一次, N 次 ≈ N*10ms),
+ * 过滤步进/舵机启动时的瞬时电流尖峰, 避免误急停。
+ */
+#define CHECK_OC_DEBOUNCE_CNT   (5U)        /* 约 50ms 消抖 */
+
 /* ---- 零点校准: 1=启用(减掉零电流时的 ADC 值, 抵消 INA180/ADC 失调) ---- */
 #define CHECK_ZERO_CALIB      (1U)
 
