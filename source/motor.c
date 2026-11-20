@@ -195,6 +195,12 @@ static uint8_t motor_limit_active(void)
 static uint8_t motor_limit_home_once(void)
 {
     uint32_t tick = 0U;
+    int32_t  start_pos = 0;
+    int32_t  cur = 0;
+    int32_t  d = 0;
+    uint32_t no_move_t = 0U;
+    uint32_t chk_ms = 0U;
+    uint8_t  pos_valid = 0U;
 
     /* 开机先解除上一次留下的堵转/过流保护, 再使能;
      * 否则驱动锁在保护态, 速度模式也不会转, 表现为"只有信息、电机不动",
@@ -217,10 +223,15 @@ static uint8_t motor_limit_home_once(void)
         return 1U;
     }
 
-    /* FD 位置模式反向走满行程逼近限位(该驱动 F6 速度模式不动作, 改用 FD)。
-     * 撞限位后 MCU 检测 PB4 立即停止, 与 lc_return_zero 的回零方式一致。 */
-    motor_move(1, MOTOR_HOME_TRAVEL_PULSE, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC,
-               MOTOR_MODE_REL_CUR, 0U);
+    /* 读出发位置, 用于"电机没走"检测(F6 发出前电机还没走) */
+    cur = motor_read_input_pulses(60U);
+    if (cur != MOTOR_ERR_TIMEOUT) {
+        start_pos = cur;
+        pos_valid = 1U;
+    }
+
+    /* 速度模式向左(负方向)匀速逼近限位 */
+    motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);
 
     while (motor_limit_active() == 0U) {
         app_service();                 /* 回零最长 30 秒, 期间照样应答上位机 */
@@ -232,6 +243,30 @@ static uint8_t motor_limit_home_once(void)
         if (++tick >= MOTOR_LIMIT_TIMEOUT_MS) {
             motor_stop();
             return 0U;
+        }
+
+        /* 每 100ms 读一次位置: 位置一直没离开出发位置(容差内),
+         * 说明电机堵转没动, 提前放弃, 别死等 30s 超时。 */
+        if (++chk_ms >= 100U) {
+            chk_ms = 0U;
+            if (pos_valid != 0U) {
+                cur = motor_read_input_pulses(60U);
+                if (cur != MOTOR_ERR_TIMEOUT) {
+                    d = cur - start_pos;
+                    if (d < 0) {
+                        d = -d;
+                    }
+                    if (d <= MOTOR_NO_MOVE_TOL_PULSE) {
+                        no_move_t += 100U;
+                        if (no_move_t >= MOTOR_NO_MOVE_MS) {
+                            motor_stop();
+                            return 0U;
+                        }
+                    } else {
+                        no_move_t = 0U;
+                    }
+                }
+            }
         }
     }
 

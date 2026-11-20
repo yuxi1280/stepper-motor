@@ -150,7 +150,7 @@
 #define CANP_EV_SELF_ABORT      (0x05U)
 #define CANP_EV_PASS_START      (0x06U)       /* 标定第 N 轮开始, DETAIL=N */
 #define CANP_EV_PASS_DONE       (0x07U)       /* 本轮结束, RESULT=确认点数(0xFF=本轮失败) */
-#define CANP_EV_RETURN0         (0x08U)       /* 回0位, RESULT: 0开始 1位置到位 2限位触发 3超时 */
+#define CANP_EV_RETURN0         (0x08U)       /* 回0位, RESULT: 0开始 1位置到位 2限位触发 3超时 4整行程 5位移离谱 6电机没走 */
 
 /* 0x88 自检阶段(DETAIL) */
 #define CANP_PH_HOME            (1U)

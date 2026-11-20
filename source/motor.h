@@ -81,12 +81,13 @@ int32_t motor_deg_to_pulse(int32_t deg_x100);  /* deg_x100: 角度*100, 返回�
  */
 #define MOTOR_LIMIT_PORT        (GPIO_PORT_B)   /* 限位输入端口 */
 #define MOTOR_LIMIT_PIN         (GPIO_PIN_04)   /* 限位输入引脚, 低电平=触发 */
-#define MOTOR_LIMIT_SPEED       (80U)          /* 逼近速度 RPM */
+#define MOTOR_LIMIT_SPEED       (80U)          /* 逼近速度 RPM(慢速防撞) */
 #define MOTOR_LIMIT_ACC         (100U)          /* 加速度档 */
-#define MOTOR_LIMIT_TIMEOUT_MS  (60000U)        /* 超时 60s 防限位失效 */
-/* 回零行程上限: 2000mm 对应脉冲(覆盖 1400mm 全行程 + 余量)。
- * 注意: 回零用 FD 位置模式(相对运动), 不用 F6 速度模式 —— 该驱动 F6 速度模式不动作。 */
-#define MOTOR_HOME_TRAVEL_PULSE (133333UL)      /* 2000mm * 3200 / 48 */
+#define MOTOR_LIMIT_TIMEOUT_MS  (30000U)        /* 超时 30s 防限位失效 */
+/* 回零时电机"没走"检测: 位置连续这么久没离开出发位置(容差内),
+ * 说明电机堵转没动, 提前放弃, 别死等 30s 超时。 */
+#define MOTOR_NO_MOVE_TOL_PULSE (100)          /* 1.5mm 容差 */
+#define MOTOR_NO_MOVE_MS        (2000U)        /* 2 秒位置不动就放弃 */
 
 uint8_t motor_limit_home(void);          /* 返回1=回零成功 0=超时失败 */
 void motor_limit_task(void);             /* 主循环每轮调用: 限位沿检测 */

@@ -245,9 +245,12 @@ static uint8_t lc_limit_active(void)
 /* 回 0 位: 相对退回 s_base_pulse, 并以"撞到限位开关"作为最终的到 0 判据 */
 static uint8_t lc_return_zero(void)
 {
-    int32_t cur, delta;
+    int32_t  cur, delta;
+    int32_t  start_pos = 0;
     uint32_t t = 0U;
+    uint32_t no_move_t = 0U;
     uint8_t  fail_cnt = 0U;
+    uint8_t  no_move_valid = 0U;
 
     can_report_event(CANP_EV_RETURN0, 0U, 0U);
     motor_clear_alarm();
@@ -263,12 +266,15 @@ static uint8_t lc_return_zero(void)
         motor_move(1, (uint32_t)LC_TARGET_PULSE, LC_RETURN_RPM, LC_SCAN_ACC,
                    MOTOR_MODE_REL_CUR, 0U);
         can_report_event(CANP_EV_RETURN0, 4U, 0U);
+        no_move_valid = 0U;                    /* 读不到位置: 不做"没走"检测 */
     } else {
         delta = cur - s_base_pulse;
         if ((delta <= LC_ZERO_TOL_PULSE) && (delta >= -LC_ZERO_TOL_PULSE)) {
             can_report_event(CANP_EV_RETURN0, 1U, 0U);
             return 1U;
         }
+        start_pos = cur;                       /* 记下出发位置, 用于"没走"检测 */
+        no_move_valid = 1U;
         if ((delta < (LC_TARGET_PULSE * 2)) && (delta > -(LC_TARGET_PULSE * 2))) {
             if (delta > 0) {
                 motor_move(1, (uint32_t)delta, LC_RETURN_RPM, LC_SCAN_ACC, MOTOR_MODE_REL_CUR, 0U);
@@ -315,6 +321,19 @@ static uint8_t lc_return_zero(void)
             if ((delta <= LC_ZERO_TOL_PULSE) && (delta >= -LC_ZERO_TOL_PULSE)) {
                 can_report_event(CANP_EV_RETURN0, 1U, 0U);
                 return 1U;
+            }
+            /* 电机没走检测: 位置一直停在出发位置(容差内), 说明堵转没动 */
+            if (no_move_valid != 0U) {
+                if (lc_abs32(cur - start_pos) <= LC_NO_MOVE_TOL_PULSE) {
+                    no_move_t += 20U;
+                    if (no_move_t >= LC_RETURN_NO_MOVE_MS) {
+                        motor_stop();
+                        can_report_event(CANP_EV_RETURN0, 6U, 0U);
+                        return 0U;
+                    }
+                } else {
+                    no_move_t = 0U;
+                }
             }
         } else {
             /* 连续读不到位置: 串口/驱动卡住, 别死等 30s(每轮 50ms 超时会拖到 150s),
