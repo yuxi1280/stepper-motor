@@ -343,3 +343,40 @@ void servo_center(void)
 
     servo_restore();                                 /* PULR: 恢复扭力 */
 }
+
+/* 确保舵机在中位(1500±SERVO_MID_TOL_PWM), 用于电机运动前的保护:
+ * 极低概率下回中指令丢失/舵机没执行, 舵机仍停在推出位置,
+ * 此时电机一动就会撞物料。这里读位置确认, 不在中位就主动回中再确认。
+ * 返回 1=已在中位(或回中成功) 0=读不到/回中失败(交给上层停机报故障)。
+ */
+uint8_t servo_ensure_mid(void)
+{
+    uint16_t pos;
+    uint8_t  i;
+
+    /* 先读一次当前位置 */
+    servo_read_pos();
+    if (servo_wait_reply(SERVO_REPLY_POS, 50U) != 0U) {
+        pos = g_servo_st.position;
+        if ((pos >= (SERVO_PWM_MID - SERVO_MID_TOL_PWM)) &&
+            (pos <= (SERVO_PWM_MID + SERVO_MID_TOL_PWM))) {
+            return 1U;                     /* 已在中位 */
+        }
+    }
+
+    /* 不在中位(或读不到): 主动回中, 最多试 2 次 */
+    for (i = 0U; i < 2U; i++) {
+        servo_move(SERVO_PWM_MID, SERVO_CENTER_TIME_MS);
+        DDL_DelayMS(SERVO_CENTER_TIME_MS + SERVO_CMD_GAP_MS);
+
+        servo_read_pos();
+        if (servo_wait_reply(SERVO_REPLY_POS, 50U) != 0U) {
+            pos = g_servo_st.position;
+            if ((pos >= (SERVO_PWM_MID - SERVO_MID_TOL_PWM)) &&
+                (pos <= (SERVO_PWM_MID + SERVO_MID_TOL_PWM))) {
+                return 1U;
+            }
+        }
+    }
+    return 0U;                             /* 回中失败 */
+}

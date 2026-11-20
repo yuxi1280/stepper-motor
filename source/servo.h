@@ -76,6 +76,11 @@ extern volatile uint32_t       g_servo_ok_cnt;  /* 收到 #OK! 次数 */
 
 void servo_center(void);   /* 暂停 -> 释放扭力 -> 回1500中位 -> 恢复扭力 */
 
+/* ---------------- 中位确认(运动前保护用) ---------------- */
+/* 电机运动前必须确保舵机已回到中位, 否则推出状态的舵机会撞物料。 */
+#define SERVO_MID_TOL_PWM       (20U)    /* 中位判定容差: 1500±20 */
+uint8_t servo_ensure_mid(void);          /* 确保舵机在中位, 1=已就位/已回中成功 0=失败 */
+
 
 
 #endif /* __SERVO_H__ */

@@ -258,7 +258,6 @@ int main(void)
         motor_limit_task();     
         motor_rx_task(); 
         servo_rx_task();  
-        check_task();     
         can_task();           
 
                  

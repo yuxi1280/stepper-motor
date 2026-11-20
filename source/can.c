@@ -328,7 +328,9 @@ void can_idle(void)
     can_rx_process();                      /* 上位机的 PING/状态/调试 都能回 */
     motor_rx_task();                       /* 收驱动的 9F 到位帧 / ACK */
     servo_rx_task();                       /* 收舵机应答 */
-    check_task();                          /* 阻塞期间也保持电流检测(推/校准/回零不过流漏检) */
+    /* 注意: 这里不调 check_task() —— 回零/扫描的长阻塞循环会高频调 can_idle,
+     * ADC 采样(尤其 ADC 超时时)会把 30s 超时拖成几分钟。电流检测只在
+     * "推"的延时(can_servo_delay)和主循环空闲里做。 */
     s_busy = 0U;
 }
 
@@ -336,6 +338,7 @@ static void can_servo_delay(uint32_t ms)
 {
     while (ms-- > 0U) {
         can_idle();                        /* 舵机动作 2 秒里也保持通讯 */
+        check_task();                      /* 推/回中是电流最大时刻, 这里保持过流检测 */
         DDL_DelayMS(1U);
     }
 }
@@ -1511,6 +1514,15 @@ static void can_exec_task(void)
                 can_start_park(1U);         /* 全部工位做完 -> 自动回 0 位 */
                 break;
             }
+
+            /* 运动前确保舵机已回中(1500): 防止舵机没收回来就运动、撞物料 */
+            if (servo_ensure_mid() == 0U) {
+                can_report_fault(CANP_F_SERVO_NOACK, CANP_LV_ERR, CANP_SRC_SERVO, 0U);
+                s_result  = CANP_DONE_SERVO_FAIL;
+                s_exec    = EXEC_DONE;
+                break;
+            }
+
             s_curNo = s_curSlot[s_curIdx];
             mm      = can_slot_mm(s_curNo);
             pulse   = motor_mm_to_pulse(mm);
