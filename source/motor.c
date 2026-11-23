@@ -201,6 +201,7 @@ static uint8_t motor_limit_home_once(void)
     uint32_t no_move_t = 0U;
     uint32_t chk_ms = 0U;
     uint8_t  pos_valid = 0U;
+    uint8_t  resend_cnt = 0U;
 
     /* 开机先解除上一次留下的堵转/过流保护, 再使能;
      * 否则驱动锁在保护态, 速度模式也不会转, 表现为"只有信息、电机不动",
@@ -259,8 +260,27 @@ static uint8_t motor_limit_home_once(void)
                     if (d <= MOTOR_NO_MOVE_TOL_PULSE) {
                         no_move_t += 100U;
                         if (no_move_t >= MOTOR_NO_MOVE_MS) {
-                            motor_stop();
-                            return 0U;
+                            /* 2 秒没走: F6 被堵转保护丢弃, 解除保护 + 重发一遍 */
+                            if (resend_cnt < MOTOR_RESEND_MAX) {
+                                resend_cnt++;
+                                no_move_t = 0U;
+                                motor_clear_alarm();
+                                DDL_DelayMS(20U);
+                                motor_enable(1U);
+                                DDL_DelayMS(100U);
+                                motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);  /* 重发 F6 */
+                                /* 重新记出发位置 */
+                                cur = motor_read_input_pulses(60U);
+                                if (cur != MOTOR_ERR_TIMEOUT) {
+                                    start_pos = cur;
+                                } else {
+                                    pos_valid = 0U;   /* 读不到: 放弃没走检测, 只等超时 */
+                                }
+                            } else {
+                                /* 重发耗尽: 放弃 */
+                                motor_stop();
+                                return 0U;
+                            }
                         }
                     } else {
                         no_move_t = 0U;

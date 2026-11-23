@@ -85,9 +85,11 @@ int32_t motor_deg_to_pulse(int32_t deg_x100);  /* deg_x100: 角度*100, 返回�
 #define MOTOR_LIMIT_ACC         (100U)          /* 加速度档 */
 #define MOTOR_LIMIT_TIMEOUT_MS  (30000U)        /* 超时 30s 防限位失效 */
 /* 回零时电机"没走"检测: 位置连续这么久没离开出发位置(容差内),
- * 说明电机堵转没动, 提前放弃, 别死等 30s 超时。 */
+ * 说明 F6 命令被堵转保护丢弃、电机没动。此时解除保护 + 重新发一遍 F6,
+ * 重发这么多次仍没走才放弃。 */
 #define MOTOR_NO_MOVE_TOL_PULSE (100)          /* 1.5mm 容差 */
-#define MOTOR_NO_MOVE_MS        (2000U)        /* 2 秒位置不动就放弃 */
+#define MOTOR_NO_MOVE_MS        (2000U)        /* 2 秒位置不动就重发 */
+#define MOTOR_RESEND_MAX        (2U)           /* 最多重发 F6 的次数 */
 
 uint8_t motor_limit_home(void);          /* 返回1=回零成功 0=超时失败 */
 void motor_limit_task(void);             /* 主循环每轮调用: 限位沿检测 */

@@ -357,9 +357,12 @@ static uint8_t lc_scan_pass(uint8_t pass)
     uint32_t t_ms     = 0U;
     uint32_t chk_ms   = 0U;
     int32_t  raw      = 0;
+    int32_t  start_pos = 0;
+    uint32_t no_move_t = 0U;
     uint16_t done_ref = 0U;                /* 出发时的 9F 到位计数 */
     uint8_t  last_act;
     uint8_t  act;
+    uint8_t  pos_valid = 0U;
 
     s_pass_edges = 0U;
     last_act = lc_sensor_active();
@@ -374,6 +377,10 @@ static uint8_t lc_scan_pass(uint8_t pass)
     motor_enable(1);
     DDL_DelayMS(50U);
     motor_flush_rx();
+    /* 读出发位置, 用于"电机没走"检测(FD 发出前电机还没走) */
+    if (lc_read_pulse(&start_pos, LC_POS_TIMEOUT_FAST_MS, 2U) != 0U) {
+        pos_valid = 1U;
+    }
     done_ref = g_motor_done_cnt;           /* 记下出发时的 9F 计数 */
     lc_move_forward(LC_TARGET_PULSE);
 
@@ -435,6 +442,21 @@ static uint8_t lc_scan_pass(uint8_t pass)
                     motor_stop();
                     can_report_event(CANP_EV_PASS_DONE, 0xFEU, s_pass_edges);
                     return 0U;
+                }
+                /* 电机没走检测: 位置一直没离开出发位置(容差内), 说明堵转没动 */
+                if (pos_valid != 0U) {
+                    if (lc_abs32(raw - start_pos) <= LC_NO_MOVE_TOL_PULSE) {
+                        no_move_t += LC_POS_CHECK_MS;
+                        if (no_move_t >= LC_SCAN_NO_MOVE_MS) {
+                            motor_stop();
+                            motor_stop();
+                            motor_stop();
+                            can_report_event(CANP_EV_PASS_DONE, 0xFFU, s_pass_edges);
+                            return 0U;
+                        }
+                    } else {
+                        no_move_t = 0U;
+                    }
                 }
             }
         }
