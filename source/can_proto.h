@@ -44,7 +44,7 @@
 #define CANP_C_STATUS           (0x06U)       /* 查询状态 */
 #define CANP_C_RECAL            (0x07U)       /* 重新标定凸点(换皮带) */
 #define CANP_C_COMP_GET         (0x08U)       /* 读取补偿量 */
-#define CANP_C_GOZERO           (0x09U)       /* 去 0 点位(不重新回零) */
+#define CANP_C_GOZERO           (0x09U)       /* 去 0 点位(慢速撞限位回零并重记零点) */
 #define CANP_C_CALIB            (0x0AU)       /* 主动校准(定时/上位机触发, 不覆盖参考位) */
 #define CANP_C_DEBUG            (0x0FU)       /* 调试信息(台架用) */
 

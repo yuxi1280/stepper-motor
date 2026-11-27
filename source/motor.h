@@ -81,9 +81,13 @@ int32_t motor_deg_to_pulse(int32_t deg_x100);  /* deg_x100: 角度*100, 返回�
  */
 #define MOTOR_LIMIT_PORT        (GPIO_PORT_B)   /* 限位输入端口 */
 #define MOTOR_LIMIT_PIN         (GPIO_PIN_04)   /* 限位输入引脚, 低电平=触发 */
-#define MOTOR_LIMIT_SPEED       (80U)          /* 逼近速度 RPM(慢速防撞) */
+#define MOTOR_LIMIT_SPEED       (60U)          /* 逼近速度 RPM(慢速防撞, 实测 40 不转) */
 #define MOTOR_LIMIT_ACC         (100U)          /* 加速度档 */
-#define MOTOR_LIMIT_TIMEOUT_MS  (30000U)        /* 超时 30s 防限位失效 */
+#define MOTOR_LIMIT_TIMEOUT_MS  (45000U)        /* 超时 45s(60RPM 走完 1400mm 约 29s) */
+/* 回零运动中的串口查询超时: 必须远小于"限位触发到停车的允许行程".
+ * 50ms @60RPM = 3mm 盲走, 会把限位摇臂压到底触发堵转; 5ms = 0.3mm.
+ */
+#define MOTOR_HOME_RX_TIMEOUT_MS (5U)
 /* 回零时电机"没走"检测: 位置连续这么久没离开出发位置(容差内),
  * 说明 F6 命令被堵转保护丢弃、电机没动。此时解除保护 + 重新发一遍 F6,
  * 重发这么多次仍没走才放弃。 */
@@ -92,8 +96,12 @@ int32_t motor_deg_to_pulse(int32_t deg_x100);  /* deg_x100: 角度*100, 返回�
 #define MOTOR_RESEND_MAX        (2U)           /* 最多重发 F6 的次数 */
 
 uint8_t motor_limit_home(void);          /* 返回1=回零成功 0=超时失败 */
+uint8_t motor_limit_is_active(void);     /* 1=限位开关当前触发(低电平) */
 void motor_limit_task(void);             /* 主循环每轮调用: 限位沿检测 */
 #define MOTOR_HOME_PWR_RETRY    (1U)     /* 掉电后重上电/重归零的最多重试次数 */
+/* 顶到硬限位被驱动保护后, 先反方向退约 8mm 再重试回零,
+ * 解开"车架越过开关、后续回零一直堵转"的死锁 */
+#define MOTOR_HOME_BACKOFF_PULSE (540)
 
 /* ===== 机械参数(示例: 16齿 S3M 同步轮) =====
  * S3M 节距 3.000mm -> 每圈皮带行程 = 16 * 3 = 48mm
@@ -141,6 +149,42 @@ void motor_goto_point(uint8_t n);   /* 去第 n 个工位(n 从 1 开始), 内�
 #define MOTOR_ORG_CF          (0x08U) /* 回零失败 */
 #define MOTOR_ORG_OTP_TF      (0x10U) /* 过热保护 */
 #define MOTOR_ORG_OCP_TF      (0x20U) /* 过流保护 */
+
+/* ================= 驱动自身保护状态(0x3A + 0x3B) =================
+ * 张大头驱动触发堵转/过流/过热保护后会切输出(松轴)并锁存标志, 这期间
+ * FD/F6 指令被静默丢弃、0x0A 清零也可能无效。回零/移动后必须读取校验,
+ * 否则会把失效坐标当成有效零点。
+ */
+#define MOTOR_FLT_NONE       (0x0000U)
+#define MOTOR_FLT_STALL      (0x0001U)  /* 0x3A Cgp_TF/Cgi_TF 堵转保护 */
+#define MOTOR_FLT_OVERCURR   (0x0002U)  /* 0x3B Ocp_TF 过流保护 */
+#define MOTOR_FLT_OVERTEMP   (0x0004U)  /* 0x3B Otp_TF 过热保护 */
+#define MOTOR_FLT_PWR_LOST   (0x0008U)  /* 0x3A Oac_TF 掉电标志(默认可能为1, 仅上报不判失败) */
+#define MOTOR_FLT_DISABLED   (0x0010U)  /* 0x3A Ens_TF=0 驱动未使能(松轴) */
+#define MOTOR_FLT_READ       (0x8000U)  /* 状态读取失败 */
+
+/* 会导致回零失败的驱动故障 */
+#define MOTOR_FLT_FAIL_MASK  (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR | \
+                              MOTOR_FLT_OVERTEMP | MOTOR_FLT_DISABLED | MOTOR_FLT_READ)
+
+/* 会让零点失效的驱动故障(读取失败只影响本次判定, 未必丢位置) */
+#define MOTOR_FLT_ZERO_BAD   (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR | \
+                              MOTOR_FLT_OVERTEMP | MOTOR_FLT_DISABLED)
+
+uint16_t motor_read_faults(void);       /* 读 0x3A/0x3B, 返回 MOTOR_FLT_xxx 位 */
+
+/* 回零失败原因(motor_home_last_error) */
+#define MOTOR_HOME_ERR_NONE    (0U)
+#define MOTOR_HOME_ERR_TIMEOUT (1U)     /* 限位未触发/超时 */
+#define MOTOR_HOME_ERR_ABORT   (2U)     /* 急停/停止中止 */
+#define MOTOR_HOME_ERR_DRIVER  (3U)     /* 驱动保护/松轴/状态读不到 */
+#define MOTOR_HOME_ERR_NOSTOP  (4U)     /* 限位后没确认停稳 */
+#define MOTOR_HOME_ERR_POS     (5U)     /* 归零后坐标回读校验失败 */
+
+uint8_t  motor_home_last_error(void);
+uint16_t motor_home_last_faults(void);
+
+#define MOTOR_HOME_ZERO_TOL_PULSE (50)  /* 归零后 0x32 允许残留(0.75mm) */
 
 /* 0x36 实时位置返回值语义(按实测二选一) */
 #define MOTOR_POS_MODE_PULSE    (0U)  /* 返回脉冲数, 3200/圈, 可多圈 */

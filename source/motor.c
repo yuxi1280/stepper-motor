@@ -14,6 +14,9 @@ static uint8_t s_motor_addr = MOTOR_ADDR_DEFAULT;
 static uint8_t s_motor_chk  = MOTOR_CHECK_BYTE;
 static uint8_t s_rxFailCnt  = 0U;        /* 连续收不到应答的次数(用于串口自愈) */
 
+/* 读驱动状态(可指定超时/重试): 回零循环里用短超时, 避免读状态期间电机盲走 */
+static uint16_t motor_read_faults_to(uint32_t timeout_ms, uint8_t tries);
+
 /* ================= 初始化: 限位输入 GPIO (PB4) ================= */
 void motor_init(void)
 {
@@ -191,156 +194,292 @@ static uint8_t motor_limit_active(void)
     return (GPIO_ReadInputPins(MOTOR_LIMIT_PORT, MOTOR_LIMIT_PIN) == PIN_RESET);
 }
 
-/* 单次归零: 逼近限位 -> 清零, 返回 1=成功 0=超时 */
-static uint8_t motor_limit_home_once(void)
+uint8_t motor_limit_is_active(void)
 {
-    uint32_t tick = 0U;
-    int32_t  start_pos = 0;
-    int32_t  cur = 0;
-    int32_t  d = 0;
-    uint32_t no_move_t = 0U;
-    uint32_t chk_ms = 0U;
-    uint8_t  pos_valid = 0U;
-    uint8_t  resend_cnt = 0U;
+    return motor_limit_active();
+}
 
-    /* 开机先解除上一次留下的堵转/过流保护, 再使能;
-     * 否则驱动锁在保护态, 速度模式也不会转, 表现为"只有信息、电机不动",
-     * 然后 30s 回零超时。
-     */
+/* ---- 回零结果(供 can.c 上报 0x89) ---- */
+static uint8_t  s_home_err    = MOTOR_HOME_ERR_NONE;
+static uint16_t s_home_faults = MOTOR_FLT_NONE;
+
+uint8_t  motor_home_last_error(void)  { return s_home_err; }
+uint16_t motor_home_last_faults(void) { return s_home_faults; }
+
+/* 读位置(带重试): 1=成功 */
+static uint8_t motor_try_read_pos(int32_t *pos, uint8_t tries, uint32_t timeout_ms)
+{
+    uint8_t i;
+    int32_t v;
+
+    for (i = 0U; i < tries; i++) {
+        v = motor_read_input_pulses(timeout_ms);
+        if (v != MOTOR_ERR_TIMEOUT) {
+            *pos = v;
+            return 1U;
+        }
+        DDL_DelayMS(5U);
+    }
+    return 0U;
+}
+
+/* 解除驱动保护 + 重新使能(0x0E 之后驱动会失能, 必须再发 F3) */
+static void motor_driver_unlock(void)
+{
+    motor_stop();
+    DDL_DelayMS(20U);
     motor_clear_alarm();
-    DDL_DelayMS(20);
-    motor_enable(1);
-    DDL_DelayMS(100);
+    DDL_DelayMS(20U);
+    motor_enable(1U);
+    DDL_DelayMS(100U);
+}
 
-    /* 开机已停在限位上: 直接归零, 不必再转 */
-    if (motor_limit_active()) {
+/* 限位触发后的收尾: 停稳确认 -> 解保护/使能 -> 驱动状态校验 -> 0x0A -> 坐标回读校验。
+ * 任何一步不通过都判失败: 驱动保护/松轴时 0x0A 可能被忽略, 不能假装回零成功。
+ */
+static uint8_t motor_home_finish(void)
+{
+    uint8_t  i;
+    uint8_t  still   = 0U;
+    uint8_t  pos_ok  = 0U;
+    int16_t  spd;
+    int32_t  p       = 0;
+    int32_t  last_p  = 0;
+    uint16_t f;
+
+    /* 1) 停稳: 速度=0 或位置连续不变, 累计确认 3 次 */
+    for (i = 0U; i < 10U; i++) {
+        spd = motor_read_speed_rpm(MOTOR_RX_TIMEOUT_MS);
+        if ((spd != INT16_MIN) && (spd == 0)) {
+            still++;
+        } else if (motor_try_read_pos(&p, 1U, MOTOR_RX_TIMEOUT_MS) != 0U) {
+            int32_t d = p - last_p;
+            if ((pos_ok != 0U) && (d <= 2) && (d >= -2)) {
+                still++;
+            }
+            last_p = p;
+            pos_ok  = 1U;
+        }
+        if (still >= 3U) {
+            break;
+        }
+        DDL_DelayMS(20U);
+    }
+    if (still < 3U) {
         motor_stop();
-        DDL_DelayMS(20);
-        motor_clear_alarm();
-        DDL_DelayMS(20);
-        motor_enable(1);              /* 解除报警后必须重新使能 */
-        DDL_DelayMS(50);
-        motor_zero_pos();             /* 当前位置赋为0点 */
-        return 1U;
+        s_home_err = MOTOR_HOME_ERR_NOSTOP;
+        return 0U;
     }
 
-    /* 读出发位置, 用于"电机没走"检测(F6 发出前电机还没走) */
-    cur = motor_read_input_pulses(60U);
-    if (cur != MOTOR_ERR_TIMEOUT) {
-        start_pos = cur;
+    /* 2) 解保护 + 重新使能 */
+    motor_clear_alarm();
+    DDL_DelayMS(20U);
+    motor_enable(1U);
+    DDL_DelayMS(50U);
+
+    /* 3) 驱动自身保护/松轴/状态读不到 -> 不允许定点 */
+    f = motor_read_faults();
+    if ((f & MOTOR_FLT_FAIL_MASK) != 0U) {
+        s_home_faults = f;
+        s_home_err    = MOTOR_HOME_ERR_DRIVER;
+        return 0U;
+    }
+    s_home_faults = f;                     /* 只含 Oac_TF 等非致命位, 供上报 */
+
+    /* 4) 坐标清零 + 回读校验(读回异常时重发一次 0x0A) */
+    for (i = 0U; i < 2U; i++) {
+        motor_zero_pos();
+        DDL_DelayMS(50U);
+        if (motor_try_read_pos(&p, 2U, MOTOR_RX_TIMEOUT_MS) == 0U) {
+            continue;
+        }
+        if ((p <= MOTOR_HOME_ZERO_TOL_PULSE) && (p >= -MOTOR_HOME_ZERO_TOL_PULSE)) {
+            return 1U;
+        }
+    }
+    s_home_err = MOTOR_HOME_ERR_POS;
+    return 0U;
+}
+
+/* 单次归零: 逼近限位 -> 停稳/状态校验 -> 清零,
+ * 返回 1=成功 0=失败(原因见 motor_home_last_error/faults)
+ */
+static uint8_t motor_limit_home_once(void)
+{
+    uint32_t tick       = 0U;
+    uint32_t chk_ms     = 0U;
+    uint32_t fault_ms   = 0U;
+    uint32_t no_move_t  = 0U;
+    int32_t  start_pos  = 0;
+    int32_t  cur        = 0;
+    int32_t  d          = 0;
+    uint8_t  resend_cnt = 0U;
+    uint8_t  stat_fail  = 0U;
+    uint8_t  pos_valid  = 0U;
+    uint16_t f;
+
+    s_home_err    = MOTOR_HOME_ERR_NONE;
+    s_home_faults = MOTOR_FLT_NONE;
+
+    /* 开机先解保护 + 使能; 保护清不掉直接失败, 不要带着保护空跑 */
+    motor_driver_unlock();
+    f = motor_read_faults();
+    if ((f != MOTOR_FLT_NONE) && (f != MOTOR_FLT_READ)) {
+        motor_driver_unlock();             /* 再清一次 */
+        f = motor_read_faults();
+    }
+    if ((f & MOTOR_FLT_FAIL_MASK) != 0U) {
+        s_home_faults = f;
+        s_home_err    = MOTOR_HOME_ERR_DRIVER;
+        return 0U;
+    }
+
+    /* 已经停在限位上: 直接走收尾校验 */
+    if (motor_limit_active()) {
+        motor_stop();
+        DDL_DelayMS(20U);
+        return motor_home_finish();
+    }
+
+    /* 起始位置: 读不到也能继续回零(靠限位 + 每秒驱动状态检查保护),
+     * 只是暂时不做"没走"检测; 后面读到位置再补上起点。 */
+    if (motor_try_read_pos(&start_pos, 3U, MOTOR_RX_TIMEOUT_MS) != 0U) {
         pos_valid = 1U;
     }
 
-    /* 速度模式向左(负方向)匀速逼近限位 */
+    /* 速度模式向负方向匀速逼近限位 */
     motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);
 
     while (motor_limit_active() == 0U) {
-        app_service();                 /* 回零最长 30 秒, 期间照样应答上位机 */
-        if (app_abort_active() != 0U) {  /* 急停: 立刻停下 */
+        app_service();                     /* 回零最长 30 秒, 期间照样应答上位机 */
+        if (app_abort_active() != 0U) {    /* 急停: 立刻停下 */
             motor_stop();
+            s_home_err = MOTOR_HOME_ERR_ABORT;
             return 0U;
         }
         DDL_DelayMS(1);
-        if (++tick >= MOTOR_LIMIT_TIMEOUT_MS) {
+        tick++;
+
+        if (tick >= MOTOR_LIMIT_TIMEOUT_MS) {
             motor_stop();
+            s_home_err = MOTOR_HOME_ERR_TIMEOUT;
             return 0U;
         }
 
-        /* 每 100ms 读一次位置: 位置一直没离开出发位置(容差内),
-         * 说明电机堵转没动, 提前放弃, 别死等 30s 超时。 */
+        /* 每 1s 读一次驱动状态: 驱动自己过流/堵转/松轴时立刻停, 不要继续顶。
+         * 用 5ms 短超时, 保证查询期间电机最多盲走 0.3mm(60RPM).
+         * 连续 3 秒都读不到状态 -> 认为通讯/驱动失效, 直接停, 不能盲走。
+         */
+        if (++fault_ms >= 1000U) {
+            fault_ms = 0U;
+            f = motor_read_faults_to(MOTOR_HOME_RX_TIMEOUT_MS, 1U);
+            if ((f & MOTOR_FLT_ZERO_BAD) != 0U) {
+                motor_stop();
+                s_home_faults = f;
+                s_home_err    = MOTOR_HOME_ERR_DRIVER;
+                return 0U;
+            }
+            if (f == MOTOR_FLT_READ) {
+                if (++stat_fail >= 3U) {
+                    motor_stop();
+                    s_home_faults = MOTOR_FLT_READ;
+                    s_home_err    = MOTOR_HOME_ERR_DRIVER;
+                    return 0U;
+                }
+            } else {
+                stat_fail = 0U;
+            }
+        }
+
+        /* 每 100ms 读一次位置: 没走检测; 读不到只暂停该检测,
+         * 限位与 1s 驱动状态检查仍然有效, 不再像以前那样关掉保护后死顶。
+         */
         if (++chk_ms >= 100U) {
             chk_ms = 0U;
-            if (pos_valid != 0U) {
-                cur = motor_read_input_pulses(60U);
-                if (cur != MOTOR_ERR_TIMEOUT) {
-                    d = cur - start_pos;
-                    if (d < 0) {
-                        d = -d;
-                    }
-                    if (d <= MOTOR_NO_MOVE_TOL_PULSE) {
-                        no_move_t += 100U;
-                        if (no_move_t >= MOTOR_NO_MOVE_MS) {
-                            /* 2 秒没走: F6 被堵转保护丢弃, 解除保护 + 重发一遍 */
-                            if (resend_cnt < MOTOR_RESEND_MAX) {
-                                resend_cnt++;
-                                no_move_t = 0U;
-                                motor_clear_alarm();
-                                DDL_DelayMS(20U);
-                                motor_enable(1U);
-                                DDL_DelayMS(100U);
-                                motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);  /* 重发 F6 */
-                                /* 重新记出发位置 */
-                                cur = motor_read_input_pulses(60U);
-                                if (cur != MOTOR_ERR_TIMEOUT) {
-                                    start_pos = cur;
-                                } else {
-                                    pos_valid = 0U;   /* 读不到: 放弃没走检测, 只等超时 */
-                                }
+            if (motor_try_read_pos(&cur, 1U, MOTOR_HOME_RX_TIMEOUT_MS) != 0U) {
+                if (pos_valid == 0U) {
+                    start_pos = cur;       /* 第一次读到: 从现在开始做没走检测 */
+                    pos_valid = 1U;
+                }
+                d = cur - start_pos;
+                if (d < 0) {
+                    d = -d;
+                }
+                if (d <= MOTOR_NO_MOVE_TOL_PULSE) {
+                    no_move_t += 100U;
+                    if (no_move_t >= MOTOR_NO_MOVE_MS) {
+                        /* 先停车再读完整状态, 避免读状态期间继续顶着走 */
+                        motor_stop();
+                        DDL_DelayMS(10U);
+                        f = motor_read_faults();
+                        if ((resend_cnt < MOTOR_RESEND_MAX) && ((f & MOTOR_FLT_FAIL_MASK) == 0U)) {
+                            /* 没保护、位置确实没动: 解保护 + 重发一次 F6 */
+                            resend_cnt++;
+                            no_move_t = 0U;
+                            motor_driver_unlock();
+                            motor_speed(1, MOTOR_LIMIT_SPEED, MOTOR_LIMIT_ACC);
+                            if (motor_try_read_pos(&start_pos, 2U, MOTOR_HOME_RX_TIMEOUT_MS) == 0U) {
+                                pos_valid = 0U;    /* 读不到: 暂停没走检测, 靠状态检查 */
                             } else {
-                                /* 重发耗尽: 放弃 */
-                                motor_stop();
-                                return 0U;
+                                pos_valid = 1U;
                             }
+                        } else {
+                            motor_stop();
+                            s_home_faults = f;
+                            s_home_err    = ((f & MOTOR_FLT_FAIL_MASK) != 0U)
+                                            ? MOTOR_HOME_ERR_DRIVER : MOTOR_HOME_ERR_TIMEOUT;
+                            return 0U;
                         }
-                    } else {
-                        no_move_t = 0U;
                     }
+                } else {
+                    no_move_t = 0U;
                 }
             }
         }
     }
 
-    /* 撞到限位: 停止 -> 解除堵转保护 -> 重新使能 -> 当前位置设为0点 */
+    /* 撞到限位: 停 -> 停稳/状态/坐标校验 */
     motor_stop();
-    DDL_DelayMS(20);
-    motor_clear_alarm();
-    DDL_DelayMS(20);
-    motor_enable(1);              /* 0x0E 之后驱动会失能, 必须重新使能,
-                                   * 否则后面的 FD 运动指令只回 ACK 但电机不动 */
-    DDL_DelayMS(50);
-    motor_zero_pos();
-    return 1U;
+    DDL_DelayMS(20U);
+    return motor_home_finish();
 }
 
-/* 归零后状态校验: 读 0x3B 回零状态 + 0x3A 电机状态
- * 返回 1=状态正常, 0=检测到掉电(OAC_TF 置位)
+/* 顶死后反方向退一段: 让限位开关重新落在撞块前方, 再回零才能识别到限位.
+ * 不解这个死锁时, 车架停在开关之后, 后续每次回零都会继续往死点顶.
  */
-static uint8_t motor_home_state_ok(void)
+static void motor_home_backoff(void)
 {
-    uint8_t home_st;   /* 0x3B 回零状态 */
-    uint8_t motor_st;  /* 0x3A 电机状态 */
-
-    home_st  = motor_read_home_status(MOTOR_RX_TIMEOUT_MS);
-    motor_st = motor_read_status(MOTOR_RX_TIMEOUT_MS);
-
-    (void)home_st;     /* 回零状态本版仅读取, 可按需判 ORG_CF(回零失败)等 */
-
-    /* 掉电标志 OAC_TF 置位 -> 判定掉电 */
-    if ((motor_st != 0xFFU) && ((motor_st & MOTOR_ST_OAC_TF) != 0U)) {
-        return 0U;
-    }
-    return 1U;
+    motor_driver_unlock();
+    motor_move(0, (uint32_t)MOTOR_HOME_BACKOFF_PULSE, 120U, 100U, MOTOR_MODE_REL_CUR, 0U);
+    DDL_DelayMS(1200U);                    /* 8mm @120RPM 约 0.13s, 留足加减速 */
+    motor_stop();
+    DDL_DelayMS(100U);
+    motor_driver_unlock();
 }
 
-/* 归零 + 掉电校验: 每次归零后读 0x3B/0x3A, 掉电则重新上电并重归零一次 */
+/* 归零 + 状态校验: 失败原因/状态位保存下来供 can.c 上报 0x89 */
 uint8_t motor_limit_home(void)
 {
     uint8_t try;
 
     for (try = 0U; try <= MOTOR_HOME_PWR_RETRY; try++) {
-        if (motor_limit_home_once() == 0U) {
-            return 0U;                       /* 归零超时失败 */
+        if (motor_limit_home_once() != 0U) {
+            return 1U;
         }
-        if (motor_home_state_ok() != 0U) {
-            return 1U;                       /* 状态正常(未掉电) */
+        /* 驱动堵转/过流/过热: 先退让再重试一次(解开"车架卡在开关之后"的死锁) */
+        if ((s_home_faults & (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR | MOTOR_FLT_OVERTEMP)) != 0U) {
+            if (try < MOTOR_HOME_PWR_RETRY) {
+                motor_home_backoff();
+            }
+            continue;
         }
-        /* 掉电: 重新上电(解除报警 + 重新使能), 然后重试归零 */
-        motor_clear_alarm();
-        DDL_DelayMS(20);
-        motor_enable(1);
-        DDL_DelayMS(100);
+        /* 急停/超时/停不稳/位置错重试无意义; 只有可恢复类故障重试一次 */
+        if (s_home_err != MOTOR_HOME_ERR_DRIVER) {
+            return 0U;
+        }
+        motor_driver_unlock();
     }
-    return 0U;                               /* 重试后仍掉电: 报失败 */
+    return 0U;
 }
 
 
@@ -595,6 +734,57 @@ uint8_t motor_read_home_status(uint32_t timeout_ms)
 
     if (motor_query(0x3BU, b, timeout_ms) == 0U) { return 0xFFU; }
     return b[2];
+}
+
+/* 读驱动自身保护状态: 0x3A(电机状态) + 0x3B(回零状态) -> MOTOR_FLT_xxx
+ * 驱动触发堵转/过流/过热会切输出(松轴)并锁存, 这期间运动指令被丢弃、0x0A 可能无效。
+ * 任一状态读取失败返回 MOTOR_FLT_READ, 上层不能把"读不到"当成正常。
+ */
+static uint16_t motor_read_faults_to(uint32_t timeout_ms, uint8_t tries)
+{
+    uint8_t  st   = 0xFFU;
+    uint8_t  home = 0xFFU;
+    uint8_t  i;
+    uint16_t f = MOTOR_FLT_NONE;
+
+    for (i = 0U; i < tries; i++) {
+        st = motor_read_status(timeout_ms);
+        if (st != 0xFFU) {
+            break;
+        }
+    }
+    for (i = 0U; i < tries; i++) {
+        home = motor_read_home_status(timeout_ms);
+        if (home != 0xFFU) {
+            break;
+        }
+    }
+    if ((st == 0xFFU) || (home == 0xFFU)) {
+        return MOTOR_FLT_READ;
+    }
+
+    if ((st & (MOTOR_ST_CGP_TF | MOTOR_ST_CGI_TF)) != 0U) {
+        f |= MOTOR_FLT_STALL;
+    }
+    if ((st & MOTOR_ST_OAC_TF) != 0U) {
+        f |= MOTOR_FLT_PWR_LOST;           /* 仅上报: 该位来源可能是历史掉电 */
+    }
+    if ((st & MOTOR_ST_ENS_TF) == 0U) {
+        f |= MOTOR_FLT_DISABLED;           /* 驱动已松轴 */
+    }
+    if ((home & MOTOR_ORG_OCP_TF) != 0U) {
+        f |= MOTOR_FLT_OVERCURR;
+    }
+    if ((home & MOTOR_ORG_OTP_TF) != 0U) {
+        f |= MOTOR_FLT_OVERTEMP;
+    }
+    return f;
+}
+
+/* 完整超时/重试版本: 用于回零前后和失败判定 */
+uint16_t motor_read_faults(void)
+{
+    return motor_read_faults_to(MOTOR_RX_TIMEOUT_MS, 3U);
 }
 
 /* 0x39 驱动温度: Addr 39 符号 温度 6B */

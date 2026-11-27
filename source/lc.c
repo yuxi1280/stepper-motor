@@ -242,6 +242,29 @@ static uint8_t lc_limit_active(void)
     return (GPIO_ReadInputPins(MOTOR_LIMIT_PORT, MOTOR_LIMIT_PIN) == PIN_RESET) ? 1U : 0U;
 }
 
+/* 位置到位后先停车并等驱动稳定: 否则下一段扫描 FD 可能在驱动还在收尾时被丢弃 */
+static void lc_stop_settle(void)
+{
+    motor_stop();
+    DDL_DelayMS(150U);
+}
+
+/* 等驱动完成上一段运动(ENS=1 且 PRF=1), 最多 timeout_ms */
+static void lc_wait_driver_ready(uint32_t timeout_ms)
+{
+    uint32_t t = 0U;
+    uint8_t  st;
+
+    while (t < timeout_ms) {
+        st = motor_read_status(LC_POS_TIMEOUT_MS);
+        if ((st != 0xFFU) && ((st & MOTOR_ST_ENS_TF) != 0U) && ((st & MOTOR_ST_PRF_TF) != 0U)) {
+            return;
+        }
+        DDL_DelayMS(20U);
+        t += 20U;
+    }
+}
+
 /* 回 0 位: 相对退回 s_base_pulse, 并以"撞到限位开关"作为最终的到 0 判据 */
 static uint8_t lc_return_zero(void)
 {
@@ -270,6 +293,7 @@ static uint8_t lc_return_zero(void)
     } else {
         delta = cur - s_base_pulse;
         if ((delta <= LC_ZERO_TOL_PULSE) && (delta >= -LC_ZERO_TOL_PULSE)) {
+            lc_stop_settle();                  /* 先停稳, 避免下一轮 FD 被驱动丢弃 */
             can_report_event(CANP_EV_RETURN0, 1U, 0U);
             return 1U;
         }
@@ -319,6 +343,7 @@ static uint8_t lc_return_zero(void)
             fail_cnt = 0U;
             delta = cur - s_base_pulse;
             if ((delta <= LC_ZERO_TOL_PULSE) && (delta >= -LC_ZERO_TOL_PULSE)) {
+                lc_stop_settle();              /* 先停稳, 避免下一轮 FD 被驱动丢弃 */
                 can_report_event(CANP_EV_RETURN0, 1U, 0U);
                 return 1U;
             }
@@ -375,14 +400,28 @@ static uint8_t lc_scan_pass(uint8_t pass)
     motor_clear_alarm();
     DDL_DelayMS(20U);
     motor_enable(1);
-    DDL_DelayMS(50U);
+    DDL_DelayMS(100U);
+    lc_wait_driver_ready(300U);            /* 等上一段回 0 运动完全结束再发 FD */
     motor_flush_rx();
     /* 读出发位置, 用于"电机没走"检测(FD 发出前电机还没走) */
-    if (lc_read_pulse(&start_pos, LC_POS_TIMEOUT_FAST_MS, 2U) != 0U) {
+    if (lc_read_pulse(&start_pos, LC_POS_TIMEOUT_MS, 3U) != 0U) {
         pos_valid = 1U;
     }
     done_ref = g_motor_done_cnt;           /* 记下出发时的 9F 计数 */
     lc_move_forward(LC_TARGET_PULSE);
+
+    /* 起步确认: 回 0 刚到位时 FD 可能被驱动丢弃, 400ms 没动就重发一次。
+     * 第一个凸点在 118mm(约 3.7s)之后, 这个等待不会漏检。 */
+    DDL_DelayMS(400U);
+    if (lc_read_pulse(&raw, LC_POS_TIMEOUT_MS, 2U) != 0U) {
+        if (pos_valid == 0U) {
+            start_pos = raw;               /* 起点没读到: 以这里为起点做没走检测 */
+            pos_valid = 1U;
+        } else if (lc_abs32(raw - start_pos) <= LC_NO_MOVE_TOL_PULSE) {
+            lc_move_forward(LC_TARGET_PULSE);   /* 没动: 重发 FD 一次 */
+            DDL_DelayMS(50U);
+        }
+    }
 
     for (;;) {
         app_service();                      /* 扫描 20 多秒, 期间照样应答上位机 */

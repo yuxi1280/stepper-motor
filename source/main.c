@@ -50,8 +50,6 @@ static void INT_SRC_CAN_INT_IrqCallback(void);
 static void INT_SRC_ADC1_EOCA_IrqCallback(void);
 /* Configures ADC. */
 //static void App_ADCCfg(void);
-/* Configures USARTx. */
-static void App_USARTxCfg(void);
 /* Configures CAN. */
 static void App_CANCfg(void);
 /*******************************************************************************
@@ -227,8 +225,7 @@ int main(void)
     App_IntCfg();
     //ADC Config
     //App_ADCCfg();
-    //USARTx Config
-    App_USARTxCfg();
+    //USARTx: 由 uart_driver_init()/servo_init() 内部完成, 这里只做 App_PortCfg 的引脚复用
     //SysTick: CAN 协议的心跳/超时/节拍时基(1ms)
     (void)SysTick_Init(1000UL);
     //CAN Config
@@ -314,52 +311,6 @@ static void App_ADCCfg(void)
 
     /* ADC Int configuration */
     ADC_IntCmd(CM_ADC1, ADC_INT_EOCA, ENABLE);
-}
-
-//USARTx Config
-static void App_USARTxCfg(void)
-{
-    stc_usart_uart_init_t stcUartInit;
-
-    /* Enable USART1 clock */
-    FCG_Fcg1PeriphClockCmd(FCG1_PERIPH_USART1, ENABLE);
-    /************************* Configure USART1***************************/
-    USART_DeInit(CM_USART1);
-    (void)USART_UART_StructInit(&stcUartInit);
-    stcUartInit.u32ClockSrc = USART_CLK_SRC_INTERNCLK;
-    stcUartInit.u32ClockDiv = USART_CLK_DIV1;
-    stcUartInit.u32CKOutput = USART_CK_OUTPUT_DISABLE;
-    stcUartInit.u32Baudrate = 115200UL;
-    stcUartInit.u32DataWidth = USART_DATA_WIDTH_8BIT;
-    stcUartInit.u32StopBit = USART_STOPBIT_1BIT;
-    stcUartInit.u32Parity = USART_PARITY_NONE;
-    stcUartInit.u32OverSampleBit = USART_OVER_SAMPLE_16BIT;
-    stcUartInit.u32FirstBit = USART_FIRST_BIT_LSB;
-    stcUartInit.u32StartBitPolarity = USART_START_BIT_FALLING;
-    stcUartInit.u32HWFlowControl = USART_HW_FLOWCTRL_RTS;
-    USART_UART_Init(CM_USART1, &stcUartInit, NULL);
-    /* Enable USART_TX | USART_RX function */
-    USART_FuncCmd(CM_USART1, (USART_TX | USART_RX), ENABLE);
-
-    /* Enable USART3 clock */
-    FCG_Fcg1PeriphClockCmd(FCG1_PERIPH_USART3, ENABLE);
-    /************************* Configure USART3***************************/
-    USART_DeInit(CM_USART3);
-    (void)USART_UART_StructInit(&stcUartInit);
-    stcUartInit.u32ClockSrc = USART_CLK_SRC_INTERNCLK;
-    stcUartInit.u32ClockDiv = USART_CLK_DIV1;
-    stcUartInit.u32CKOutput = USART_CK_OUTPUT_DISABLE;
-    stcUartInit.u32Baudrate = 115200UL;
-    stcUartInit.u32DataWidth = USART_DATA_WIDTH_8BIT;
-    stcUartInit.u32StopBit = USART_STOPBIT_1BIT;
-    stcUartInit.u32Parity = USART_PARITY_NONE;
-    stcUartInit.u32OverSampleBit = USART_OVER_SAMPLE_16BIT;
-    stcUartInit.u32FirstBit = USART_FIRST_BIT_LSB;
-    stcUartInit.u32StartBitPolarity = USART_START_BIT_FALLING;
-    stcUartInit.u32HWFlowControl = USART_HW_FLOWCTRL_RTS;
-    USART_UART_Init(CM_USART3, &stcUartInit, NULL);
-    /* Enable USART_TX | USART_RX function */
-    USART_FuncCmd(CM_USART3, (USART_TX | USART_RX), ENABLE);
 }
 
 //CAN Config

@@ -59,6 +59,7 @@ static uint32_t          s_dbgT0;
 static void can_hw_config(void);
 static void can_rx_process(void);
 static void can_servo_delay(uint32_t ms);
+static void can_report_home_fail(uint8_t fatal);
 
 /* ================= 设备状态 ================= */
 static uint8_t s_txSeq;                   /* 设备主动帧的序号 */
@@ -69,6 +70,10 @@ static uint8_t s_faultLv;
 static uint8_t s_commLost;
 static uint8_t s_bootDone;
 static uint8_t s_lastFaultCode;
+/* 零点有效性: 1=已回零且驱动状态/坐标校验通过。
+ * 驱动过流/堵转保护会松轴并丢位置, 这时 zero_pos 可能无效, 必须置 0,
+ * 拒绝任务直到重新回零成功(0x09/0x05 自检/0x0A 校准)。 */
+static uint8_t s_zeroValid;
 
 /* 主动校准状态 */
 static uint8_t  s_calibRun;               /* 1=主动校准进行中 */
@@ -389,6 +394,21 @@ static uint8_t can_move_wait(int32_t pulse, uint16_t rpm, uint8_t acc)
     return 0U;
 }
 
+/* 标定/校准结束回 0: 此时零点已知, 先用位置模式回坐标 0, 不再全行程速度模式撞限位。
+ * 到位后确认限位开关仍闭合; 不闭合(零点有偏移)再从当前位置短距离慢速找限位。
+ * 正常情况不再以速度模式全行程顶限位, 从根上减少"校准最后回零顶死"的次数。
+ */
+static uint8_t can_return_to_zero_safe(void)
+{
+    if (can_move_wait(s_zeroRef, POS_RPM, POS_ACC) != 0U) {
+        if (motor_limit_is_active() != 0U) {
+            return 1U;                        /* 位置到位且限位闭合: 零点确认 */
+        }
+        /* 位置到位但限位没闭合: 零点有偏移, 从当前位置慢速找限位(距离很短) */
+    }
+    return motor_limit_home();
+}
+
 /* 开始回 0 点位运动(不是回零, 只是走到坐标 0)
  * after_task = 1: 任务做完了自动回 0, 到位后报 0x84
  * after_task = 0: 0x09 命令触发, 到位后报 0x8B
@@ -416,8 +436,34 @@ static void can_start_park(uint8_t after_task)
         s_parkMode = 0U;
         s_state    = CANP_ST_IDLE;
         if (after_task != 0U) {
-            s_result = CANP_DONE_PARK_FAIL;
-            s_exec   = EXEC_DONE;
+            /* 位置读不到但没有运动指令发出: 用慢速撞限位重新定点,
+             * 成功则视为已回 0(同时修复零点), 失败才报 PARK_FAIL。 */
+            uint8_t bOk;
+
+            s_state = CANP_ST_HOMING;
+            if (motor_limit_home() != 0U) {
+                DDL_DelayMS(150U);
+                motor_flush_rx();
+                bOk = lc_set_base();
+                if (bOk == 0U) {
+                    DDL_DelayMS(150U);
+                    motor_flush_rx();
+                    bOk = lc_set_base();
+                }
+                s_zeroRef   = (bOk != 0U) ? lc_get_base() : 0;   /* 刚清零, 读不到按 0 兜底 */
+                s_lastPulse = s_zeroRef;
+                s_lastSlot  = 0U;
+                s_zeroValid = 1U;
+                s_state     = CANP_ST_IDLE;
+                s_result    = CANP_DONE_OK;
+                s_exec      = EXEC_DONE;
+            } else {
+                s_zeroValid = 0U;
+                can_report_home_fail(0U);
+                s_state     = (s_faultLv >= CANP_LV_FATAL) ? CANP_ST_FAULT : CANP_ST_IDLE;
+                s_result    = CANP_DONE_PARK_FAIL;
+                s_exec      = EXEC_DONE;
+            }
         } else {
             uint8_t r[3];
             r[0] = CANP_GZ_FAIL;
@@ -628,7 +674,12 @@ void can_report_fault(uint8_t code, uint8_t lv, uint8_t src, uint16_t param)
 /* 调试信息: [isr][rx][acc][dis][RTIE][RTIF][RCTRL][ACFEN][CFG_STAT][TECNT][RECNT][lastID x4] */
 void can_report_debug(void)
 {
-    uint8_t d[29];
+    uint8_t d[32];
+    uint8_t mst;
+    uint8_t mhs;
+
+    mst = motor_read_status(10U);       /* 0x3A 电机状态(短超时, 运动中查询不长时间阻塞) */
+    mhs = motor_read_home_status(10U);  /* 0x3B 回零状态 */
 
     d[0]  = s_dbgIsr;
     d[1]  = s_dbgRx;
@@ -661,8 +712,11 @@ void can_report_debug(void)
     d[26] = (uint8_t)((uint32_t)s_moveWant);/* 最近一次下发的位移(脉冲) */
     d[27] = (uint8_t)(CM_RMU->RSTF0);       /* 上次复位原因(低字节) */
     d[28] = (uint8_t)(CM_RMU->RSTF0 >> 8);
+    d[29] = mst;                            /* 0x3A 电机状态: bit3堵转保护 bit2堵转 bit0使能 */
+    d[30] = mhs;                            /* 0x3B 回零状态: bit5过流 bit4过热 bit3回零失败 */
+    d[31] = s_zeroValid;                    /* 1=零点有效 0=需重新回零 */
 
-    can_tx_msg(CANP_R_DEBUG, can_next_seq(), d, 29U);
+    can_tx_msg(CANP_R_DEBUG, can_next_seq(), d, 32U);
 }
 
 /* ================= 急停 / 故障 ================= */
@@ -672,6 +726,7 @@ void can_estop(void)
     motor_enable(0);                       /* 步进下电(失能松轴) */
     servo_release();                       /* 舵机释放扭力 */
     app_abort_calib();                     /* 若在校准: 中止校准动作 */
+    s_zeroValid = 0U;                      /* 步进失能后零点不再可信 */
 
     if (s_exec != EXEC_IDLE) {
         uint8_t d[3];
@@ -693,6 +748,13 @@ void can_raise_fault(uint8_t code, uint8_t lv, uint8_t src, uint16_t param)
     s_fault   = code;
     s_faultLv = lv;
 
+    /* 驱动保护/回零/位置类故障 -> 零点不可信, 必须重新回零 */
+    if ((lv >= CANP_LV_FATAL) ||
+        (code == CANP_F_MOTOR_PWR) || (code == CANP_F_MOTOR_STALL) ||
+        (code == CANP_F_HOME_TIMEOUT) || (code == CANP_F_POSITION)) {
+        s_zeroValid = 0U;
+    }
+
     can_report_fault(code, lv, src, param);
 
     if (lv >= CANP_LV_FATAL) {
@@ -712,6 +774,59 @@ void can_raise_fault(uint8_t code, uint8_t lv, uint8_t src, uint16_t param)
 
 uint8_t can_fault_code(void) { return s_fault; }
 uint8_t can_is_fault(void)   { return (s_fault != 0U) ? 1U : 0U; }
+
+/* 回零失败上报: 把驱动保护位/失败原因映射成 0x89。
+ * PARAM = [失败原因(高字节)][驱动状态位(低字节)], 便于上位机区分
+ * 限位超时 / 驱动过流堵转松轴 / 未停稳 / 坐标校验失败。
+ */
+static void can_report_home_fail(uint8_t fatal)
+{
+    uint8_t  e = motor_home_last_error();
+    uint16_t f = motor_home_last_faults();
+    uint16_t param = (uint16_t)(f | ((uint16_t)e << 8));
+
+    switch (e) {
+        case MOTOR_HOME_ERR_ABORT:
+            return;                        /* 被 0x04/急停中止, 不报故障 */
+        case MOTOR_HOME_ERR_TIMEOUT:
+            can_raise_fault(CANP_F_HOME_TIMEOUT, (fatal != 0U) ? CANP_LV_FATAL : CANP_LV_ERR,
+                            CANP_SRC_MOTOR, param);
+            return;
+        case MOTOR_HOME_ERR_DRIVER:
+            if ((f & (MOTOR_FLT_OVERCURR | MOTOR_FLT_OVERTEMP | MOTOR_FLT_STALL)) != 0U) {
+                can_raise_fault(CANP_F_MOTOR_STALL, (fatal != 0U) ? CANP_LV_FATAL : CANP_LV_ERR,
+                                CANP_SRC_MOTOR, param);
+            } else {
+                can_raise_fault(CANP_F_MOTOR_PWR, (fatal != 0U) ? CANP_LV_FATAL : CANP_LV_ERR,
+                                CANP_SRC_MOTOR, param);
+            }
+            return;
+        case MOTOR_HOME_ERR_NOSTOP:
+        case MOTOR_HOME_ERR_POS:
+        default:
+            can_raise_fault(CANP_F_POSITION, (fatal != 0U) ? CANP_LV_FATAL : CANP_LV_ERR,
+                            CANP_SRC_MOTOR, param);
+            return;
+    }
+}
+
+/* 回零失败原因 -> 协议故障码(0x87/0x8D 的 RESULT 字段用) */
+static uint8_t can_home_fault_code(void)
+{
+    uint8_t  e = motor_home_last_error();
+    uint16_t f = motor_home_last_faults();
+
+    if (e == MOTOR_HOME_ERR_DRIVER) {
+        if ((f & (MOTOR_FLT_OVERCURR | MOTOR_FLT_OVERTEMP | MOTOR_FLT_STALL)) != 0U) {
+            return CANP_F_MOTOR_STALL;
+        }
+        return CANP_F_MOTOR_PWR;
+    }
+    if ((e == MOTOR_HOME_ERR_NOSTOP) || (e == MOTOR_HOME_ERR_POS)) {
+        return CANP_F_POSITION;
+    }
+    return CANP_F_HOME_TIMEOUT;
+}
 
 /* ================= 接收 ================= */
 static void can_dispatch(uint8_t cmd, uint8_t seq, const uint8_t *d, uint8_t len);
@@ -913,6 +1028,15 @@ static void can_handle_task(uint8_t seq, const uint8_t *d, uint8_t len)
         can_tx_msg(CANP_R_TASK_ACK, seq, ack, 3U);
         return;
     }
+    if (s_zeroValid == 0U) {
+        /* 零点不可信(驱动保护/回零失败): 拒收, 要求先 0x09 重新回零 */
+        ack[0] = CANP_ACK_PARAM;
+        ack[1] = n;
+        ack[2] = 0U;
+        can_report_fault(CANP_F_HOME_TIMEOUT, CANP_LV_ERR, CANP_SRC_MOTOR, 0xFFFFU);
+        can_tx_msg(CANP_R_TASK_ACK, seq, ack, 3U);
+        return;
+    }
     if (s_qCnt >= CANP_TASK_QUEUE_MAX) {
         ack[0] = CANP_ACK_QUEUE_FULL;
         ack[1] = n;
@@ -964,10 +1088,14 @@ static void can_handle_stop(uint8_t seq)
     s_state   = (s_faultLv >= CANP_LV_FATAL) ? CANP_ST_FAULT : CANP_ST_IDLE;
 }
 
-/* 0x09 去 0 点位: 立即应答"已接受", 到位后回"已到达" */
+/* 0x09 去 0 点位: 采用开机自检同款"慢速撞限位回零", 成功后重新标记零点。
+ * 立即应答"已接受", 回零完成后回"已到达"/"失败"(最长约 30s, 期间照常应答 CAN)。
+ */
 static void can_handle_goto_zero(uint8_t seq)
 {
     uint8_t r[3];
+    uint8_t ok;
+    uint8_t baseOk;
 
     r[0] = CANP_GZ_ACCEPT;
     r[1] = 0U;
@@ -984,9 +1112,45 @@ static void can_handle_goto_zero(uint8_t seq)
         return;
     }
 
-    s_parkSeq = seq;
+    can_tx_msg(CANP_R_GOZERO, seq, r, 3U);      /* 已接受 */
+
+    /* 慢速回零(与开机自检相同): 撞限位 -> 0x0A 坐标清零 -> 重记 0 点 */
+    app_abort_clear();                          /* 清掉上一次急停残留的中止标志 */
+    s_state = CANP_ST_HOMING;
+    ok = motor_limit_home();
+    s_state = (s_faultLv >= CANP_LV_FATAL) ? CANP_ST_FAULT : CANP_ST_IDLE;
+
+    if (ok == 0U) {
+        if (motor_home_last_error() != MOTOR_HOME_ERR_ABORT) {
+            s_zeroValid = 0U;                   /* 回零没完成: 零点不可信 */
+        }                                       /* 被 0x04 中止: 旧零点坐标仍有效 */
+        can_report_home_fail(0U);
+        r[0] = CANP_GZ_FAIL;                    /* 限位未触发/超时/驱动保护/被 0x04 中止 */
+        can_tx_msg(CANP_R_GOZERO, seq, r, 3U);
+        return;
+    }
+
+    /* 0x0A 已把驱动坐标清零, 重新读一次作为新的 0 点 */
+    DDL_DelayMS(200U);                          /* 等驱动稳定, 位置读数才可靠 */
+    motor_flush_rx();
+    baseOk = lc_set_base();
+    if (baseOk == 0U) {
+        DDL_DelayMS(200U);
+        motor_flush_rx();
+        baseOk = lc_set_base();
+    }
+    if (baseOk == 0U) {
+        (void)can_serial_recover();
+        motor_flush_rx();
+        baseOk = lc_set_base();
+    }
+    s_zeroRef   = (baseOk != 0U) ? lc_get_base() : 0;  /* 刚清零, 读不到按 0 兜底 */
+    s_lastPulse = s_zeroRef;
+    s_lastSlot  = 0U;
+    s_zeroValid = 1U;                                  /* 回零+状态+坐标校验都通过 */
+
+    r[0] = CANP_GZ_ARRIVED;
     can_tx_msg(CANP_R_GOZERO, seq, r, 3U);
-    can_start_park(0U);
 }
 
 static void can_boot_run(void);
@@ -1025,8 +1189,11 @@ static void can_handle_fault_clear(uint8_t seq)
     can_serial_recover();
 
     if ((lc_ref_valid() == 0U) || (oldFault == CANP_F_SELFTEST) ||
-        (oldFault == CANP_F_HOME_TIMEOUT)) {
-        s_bootDone = 0U;
+        (oldFault == CANP_F_HOME_TIMEOUT) || (oldFault == CANP_F_MOTOR_PWR) ||
+        (oldFault == CANP_F_MOTOR_STALL) || (oldFault == CANP_F_POSITION) ||
+        (s_zeroValid == 0U)) {             /* 零点无效也走一次完整自检(含回零) */
+        s_bootDone  = 0U;
+        s_zeroValid = 0U;                  /* 重新自检会重新回零, 成功后才恢复 */
     }
 }
 
@@ -1052,8 +1219,20 @@ static void can_handle_recal(uint8_t seq)
     (void)lc_ref_clear();
     r = lc_scan_run(1U);
     if (r != LC_RESULT_ALL) {
+        uint16_t mf = motor_read_faults();
+
         (void)can_move_wait(s_zeroRef, LC_RETURN_RPM, LC_SCAN_ACC);   /* 失败也先回 0 */
         s_state = CANP_ST_IDLE;
+        if ((r == LC_RESULT_HOME_FAIL) || (r == LC_RESULT_POS_ERR)) {
+            s_zeroValid = 0U;              /* 回零/坐标失效, 需要重新回零 */
+        }
+        if ((mf & MOTOR_FLT_ZERO_BAD) != 0U) {
+            s_zeroValid = 0U;
+            can_report_fault(((mf & (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR |
+                                     MOTOR_FLT_OVERTEMP)) != 0U)
+                             ? CANP_F_MOTOR_STALL : CANP_F_MOTOR_PWR,
+                             CANP_LV_ERR, CANP_SRC_MOTOR, mf);
+        }
         d[0] = CANP_RECAL_FAIL;
         d[1] = CANP_F_SELFTEST;
         can_tx_msg(CANP_R_RECAL, seq, d, 2U);
@@ -1061,22 +1240,24 @@ static void can_handle_recal(uint8_t seq)
         return;
     }
     (void)lc_ref_save();
-    /* 标定完回 0 位: 同样直接用限位慢速回零, 长度确定、必定成功 */
+    s_zeroRef = lc_get_base();             /* 扫描前已重新回零, 刷新 0 点坐标 */
+    /* 标定完回 0 位: 零点已知, 先用位置模式回 0, 不再全行程撞限位 */
     s_state = CANP_ST_HOMING;
-    if (motor_limit_home() != 0U) {
+    if (can_return_to_zero_safe() != 0U) {
         (void)lc_set_base();
         s_zeroRef = lc_get_base();         /* 重新回零过, 刷新 0 点坐标 */
     } else {
-        /* 回零失败: 零点基准失效, 报 L3 故障停机, 等 0x05 重新自检 */
+        /* 回零失败: 零点基准失效, 上报驱动状态并停机(0x05 重新自检) */
         can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
-        can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+        can_report_home_fail(1U);
         d[0] = CANP_RECAL_FAIL;
-        d[1] = CANP_F_HOME_TIMEOUT;
+        d[1] = can_home_fault_code();
         can_tx_msg(CANP_R_RECAL, seq, d, 2U);
         return;
     }
     s_lastPulse = s_zeroRef;
     s_lastSlot = 0U;
+    s_zeroValid = 1U;
     s_state    = CANP_ST_IDLE;
 
     can_serial_recover();                  /* 标定后软复位串口/驱动, 否则读位置会全失败 */
@@ -1120,11 +1301,11 @@ static void can_calib_run(uint8_t seq, uint8_t from_cmd)
         s_calibRun = 0U;
         if (aborted == 0U) {               /* 非急停: 真回零失败才上报 */
             can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
-            can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_ERR, CANP_SRC_MOTOR, 0U);
+            can_report_home_fail(0U);
         }
         if (from_cmd != 0U) {
             d[0] = CANP_CAL_FAIL;
-            d[1] = (aborted != 0U) ? 0U : CANP_F_HOME_TIMEOUT;
+            d[1] = (aborted != 0U) ? 0U : can_home_fault_code();
             can_tx_msg(CANP_R_CALIB, seq, d, 2U);
         }
         s_calibT0 = SysTick_GetTick();
@@ -1135,17 +1316,27 @@ static void can_calib_run(uint8_t seq, uint8_t from_cmd)
     if (lc_set_base() != 0U) {
         s_zeroRef = lc_get_base();         /* 刷新 0 点坐标 */
     }
+    s_zeroValid = 1U;                      /* 回零+状态+坐标校验通过 */
 
     /* 3) 慢速扫描 + 与参考位对比(内部 lc_check_ref + lc_update_comp) */
     s_state = CANP_ST_CALIB;
     r = lc_scan_run(0U);
     if (r != LC_RESULT_ALL) {
-        uint8_t aborted = app_abort_active();
+        uint8_t  aborted = app_abort_active();
+        uint16_t mf      = motor_read_faults();
+
         (void)lc_ref_reload();             /* 扫描失败/被中止: 恢复旧补偿 */
         s_state    = CANP_ST_IDLE;
         s_calibRun = 0U;
         if (aborted == 0U) {               /* 非急停: 真扫描失败才上报 */
             can_report_event(CANP_EV_SELF_ABORT, CANP_F_SELFTEST, (uint8_t)r);
+            if ((mf & MOTOR_FLT_ZERO_BAD) != 0U) {
+                s_zeroValid = 0U;          /* 驱动保护/松轴: 零点可能已失效 */
+                can_report_fault(((mf & (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR |
+                                         MOTOR_FLT_OVERTEMP)) != 0U)
+                                 ? CANP_F_MOTOR_STALL : CANP_F_MOTOR_PWR,
+                                 CANP_LV_ERR, CANP_SRC_MOTOR, mf);
+            }
         }
         if (from_cmd != 0U) {
             d[0] = CANP_CAL_FAIL;
@@ -1161,20 +1352,23 @@ static void can_calib_run(uint8_t seq, uint8_t from_cmd)
         can_report_fault(CANP_F_SELFTEST, CANP_LV_WARN, CANP_SRC_BELT, 1U);
     }
 
-    /* 5) 慢速回零(校准结束回到 0 点) */
+    /* 5) 回 0(校准结束): 零点已知, 用位置模式回 0, 避免全行程撞限位 */
     s_state = CANP_ST_HOMING;
-    if (motor_limit_home() != 0U) {
+    if (can_return_to_zero_safe() != 0U) {
         (void)lc_set_base();
         s_zeroRef = lc_get_base();
     } else {
-        /* 回零失败: 零点基准失效, 报 L3 故障停机(拒接任务), 等 0x05 重新自检。
-         * 否则带着陈旧的 s_zeroRef 继续跑, 后续所有绝对定位都会偏移。 */
-        s_calibRun = 0U;
+        /* 回零失败: 零点基准失效。不锁 L3(避免卡死), 用 s_zeroValid=0 拒绝任务,
+         * 上位机发 0x09 重新回零即可恢复。 */
+        s_calibRun  = 0U;
+        s_zeroValid = 0U;
         can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
-        can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+        can_report_home_fail(0U);
+        /* 关键: 必须退出 HOMING 状态, 否则 0x09/0x0A/0x03 全被当成"忙"拒绝 */
+        s_state = (s_faultLv >= CANP_LV_FATAL) ? CANP_ST_FAULT : CANP_ST_IDLE;
         if (from_cmd != 0U) {
             d[0] = CANP_CAL_FAIL;
-            d[1] = CANP_F_HOME_TIMEOUT;
+            d[1] = can_home_fault_code();
             can_tx_msg(CANP_R_CALIB, seq, d, 2U);
         }
         s_calibT0 = SysTick_GetTick();
@@ -1182,6 +1376,7 @@ static void can_calib_run(uint8_t seq, uint8_t from_cmd)
     }
     s_lastPulse = s_zeroRef;
     s_lastSlot  = 0U;
+    s_zeroValid = 1U;
 
     /* 6) 串口/驱动恢复验证: 失败说明驱动侧彻底失效, 明确上报并判校准失败 */
     if (can_serial_recover() == 0U) {
@@ -1366,7 +1561,7 @@ static void can_boot_run(void)
     motor_enable(1);
     if (motor_limit_home() == 0U) {
         can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
-        can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+        can_report_home_fail(1U);
         return;
     }
     DDL_DelayMS(200U);                     /* 等驱动稳定, 位置读数才可靠 */
@@ -1391,6 +1586,7 @@ static void can_boot_run(void)
     s_zeroRef     = (baseOk != 0U) ? lc_get_base() : 0;
     s_lastPulse   = s_zeroRef;
     s_targetPulse = s_zeroRef;
+    s_zeroValid   = 1U;                    /* 回零+状态+坐标校验通过, 允许接任务 */
 
     /* 2) 有没有已存的凸点/补偿 */
     if (lc_ref_valid() == 0U) {
@@ -1405,12 +1601,20 @@ static void can_boot_run(void)
         }
         if (r != LC_RESULT_ALL) {
             /* 失败时把机构所在位置(mm)带在 0x89 参数里, LC 结果码放在 0x88 的 DETAIL */
-            int32_t mm = (lc_get_base() * (int32_t)LC_MM_PER_REV) /
-                         (int32_t)MOTOR_PULSES_PER_REV;
+            int32_t  mm = (lc_get_base() * (int32_t)LC_MM_PER_REV) /
+                          (int32_t)MOTOR_PULSES_PER_REV;
+            uint16_t mf = motor_read_faults();
 
             (void)can_move_wait(s_zeroRef, LC_RETURN_RPM, LC_SCAN_ACC);   /* 失败也先回 0 */
             s_state = CANP_ST_FAULT;
             can_report_event(CANP_EV_SELF_ABORT, CANP_F_SELFTEST, (uint8_t)r);
+            if ((mf & MOTOR_FLT_ZERO_BAD) != 0U) {
+                s_zeroValid = 0U;
+                can_report_fault(((mf & (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR |
+                                         MOTOR_FLT_OVERTEMP)) != 0U)
+                                 ? CANP_F_MOTOR_STALL : CANP_F_MOTOR_PWR,
+                                 CANP_LV_ERR, CANP_SRC_MOTOR, mf);
+            }
             can_raise_fault(CANP_F_SELFTEST, CANP_LV_FATAL, CANP_SRC_BELT, (uint16_t)mm);
             return;
         }
@@ -1424,14 +1628,16 @@ static void can_boot_run(void)
          * 注意: 速度不能低于驱动最低速度(实测 40RPM 驱动不动作, 电机根本不动)。 */
 
         s_state = CANP_ST_HOMING;
-        if (motor_limit_home() != 0U) {
+        if (can_return_to_zero_safe() != 0U) {
             (void)lc_set_base();
             s_zeroRef   = lc_get_base();
             s_lastPulse = s_zeroRef;
+            s_zeroValid = 1U;
         } else {
-            /* 标定后回零失败: 零点基准失效, 报 L3 故障停机, 等 0x05 重新自检 */
+            /* 标定后回零失败: 零点基准失效, 报驱动状态并锁 L3, 等 0x05 重新自检 */
+            s_zeroValid = 0U;
             can_report_event(CANP_EV_SELF_ABORT, CANP_F_HOME_TIMEOUT, CANP_PH_HOME);
-            can_raise_fault(CANP_F_HOME_TIMEOUT, CANP_LV_FATAL, CANP_SRC_MOTOR, 0U);
+            can_report_home_fail(1U);
             return;
         }
         /* ★ 标定结束后把串口和驱动软复位一次:
@@ -1466,6 +1672,7 @@ static void can_exec_task(void)
         s_parkMode = 0U;
         s_state    = CANP_ST_IDLE;
         s_progMs   = now;
+        s_zeroValid = 0U;                  /* 卡死 40s 未推进, 零点不再可信 */
         s_fault    = CANP_F_POSITION;
         s_faultLv  = CANP_LV_ERR;
         can_report_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR, 2U);
@@ -1539,6 +1746,16 @@ static void can_exec_task(void)
                 }
                 s_readRetry = 0U;
                 /* 多轮都读不到: 不瞎走, 报位置异常并中止本包(参数 1 = 位置读取失败) */
+                {
+                    uint16_t mf = motor_read_faults();
+                    if ((mf & MOTOR_FLT_ZERO_BAD) != 0U) {
+                        s_zeroValid = 0U;          /* 驱动保护/松轴 -> 零点失效 */
+                        can_report_fault(((mf & (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR |
+                                                 MOTOR_FLT_OVERTEMP)) != 0U)
+                                         ? CANP_F_MOTOR_STALL : CANP_F_MOTOR_PWR,
+                                         CANP_LV_ERR, CANP_SRC_MOTOR, mf);
+                    }
+                }
                 s_fault   = CANP_F_POSITION;
                 s_faultLv = CANP_LV_ERR;
                 can_report_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR, 1U);
@@ -1623,9 +1840,19 @@ static void can_exec_task(void)
                               ? 0x7FFF
                               : ((act - s_zeroRef) * (int32_t)LC_MM_PER_REV
                                  / (int32_t)MOTOR_PULSES_PER_REV);
+                uint16_t mf = motor_read_faults();
 
                 s_progMs = now;
                 motor_stop();
+
+                /* 驱动自己的过流/堵转/松轴: 明确上报并作废零点, 不再继续用旧坐标 */
+                if ((mf & MOTOR_FLT_ZERO_BAD) != 0U) {
+                    s_zeroValid = 0U;
+                    can_report_fault(((mf & (MOTOR_FLT_STALL | MOTOR_FLT_OVERCURR |
+                                             MOTOR_FLT_OVERTEMP)) != 0U)
+                                     ? CANP_F_MOTOR_STALL : CANP_F_MOTOR_PWR,
+                                     CANP_LV_ERR, CANP_SRC_MOTOR, mf);
+                }
                 s_fault     = CANP_F_POSITION;     /* 同时发 0x89 (L2) */
                 s_faultLv   = CANP_LV_ERR;
                 can_report_fault(CANP_F_POSITION, CANP_LV_ERR, CANP_SRC_MOTOR,
@@ -1634,8 +1861,32 @@ static void can_exec_task(void)
                     s_parkMode = 0U;
                     s_state    = CANP_ST_IDLE;
                     if (s_parkAfter != 0U) {
-                        s_result = CANP_DONE_PARK_FAIL;   /* 工位做完了, 回0失败 */
-                        s_exec   = EXEC_DONE;
+                        /* 自动回 0 失败: 先用慢速撞限位重新定点(修复零点),
+                         * 成功则按正常完成收尾, 失败才报 PARK_FAIL。 */
+                        uint8_t bOk;
+
+                        s_state = CANP_ST_HOMING;
+                        if (motor_limit_home() != 0U) {
+                            DDL_DelayMS(150U);
+                            motor_flush_rx();
+                            bOk = lc_set_base();
+                            if (bOk == 0U) {
+                                DDL_DelayMS(150U);
+                                motor_flush_rx();
+                                bOk = lc_set_base();
+                            }
+                            s_zeroRef   = (bOk != 0U) ? lc_get_base() : 0;
+                            s_lastPulse = s_zeroRef;
+                            s_lastSlot  = 0U;
+                            s_zeroValid = 1U;
+                            s_result    = CANP_DONE_OK;
+                        } else {
+                            s_zeroValid = 0U;
+                            can_report_home_fail(0U);
+                            s_result    = CANP_DONE_PARK_FAIL;   /* 工位做完了, 回0失败 */
+                        }
+                        s_state = (s_faultLv >= CANP_LV_FATAL) ? CANP_ST_FAULT : CANP_ST_IDLE;
+                        s_exec  = EXEC_DONE;
                     } else {
                         uint8_t r[3];
                         r[0] = CANP_GZ_FAIL;
@@ -1819,6 +2070,7 @@ void can_init(void)
     s_commLost = 0U;
     s_bootDone = 0U;
     s_lastFaultCode = 0U;
+    s_zeroValid = 0U;
     s_qHead = 0U;
     s_qTail = 0U;
     s_qCnt  = 0U;
